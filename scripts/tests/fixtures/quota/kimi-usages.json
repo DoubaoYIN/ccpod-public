@@ -1,0 +1,47 @@
+{
+  "usage": {
+    "limit": "100",
+    "remaining": "100",
+    "resetTime": "2026-10-02T03:19:10.513069Z"
+  },
+  "limits": [
+    {
+      "window": {
+        "duration": 300,
+        "timeUnit": "TIME_UNIT_MINUTE"
+      },
+      "detail": {
+        "limit": "100",
+        "remaining": "100",
+        "resetTime": "2026-10-01T11:19:10.513069Z"
+      }
+    }
+  ],
+  "usages": {
+    "limit_5h": {
+      "used_ratio": 0,
+      "reset_time": "2026-10-01T11:19:09Z"
+    },
+    "limit_7d": {
+      "used_ratio": 1.9e-05,
+      "reset_time": "2026-10-02T03:19:10Z"
+    }
+  },
+  "booster_wallet": {
+    "balance": {
+      "feature": "FEATURE_OMNI",
+      "type": "BOOSTER",
+      "unit": "UNIT_CURRENCY"
+    },
+    "status": "STATUS_ACTIVE",
+    "allowTopup": true,
+    "monthlyChargeLimit": {
+      "currency": "CNY",
+      "priceInCents": "10000"
+    },
+    "monthlyUsed": {
+      "currency": "CNY",
+      "priceInCents": "0"
+    }
+  }
+}

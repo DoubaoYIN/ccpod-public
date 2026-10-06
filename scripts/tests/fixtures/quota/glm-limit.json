@@ -1,0 +1,30 @@
+{
+ "code": 200,
+ "msg": "操作成功",
+ "data": {
+  "limits": [
+   {
+    "type": "CREDIT_LIMIT",
+    "unit": 3,
+    "number": 5,
+    "usage": 12000,
+    "currentValue": 569,
+    "remaining": 11430,
+    "percentage": 4,
+    "nextResetTime": 1790852261919
+   },
+   {
+    "type": "CREDIT_LIMIT",
+    "unit": 6,
+    "number": 1,
+    "usage": 60000,
+    "currentValue": 20970,
+    "remaining": 39029,
+    "percentage": 34,
+    "nextResetTime": 1791272809951
+   }
+  ],
+  "level": "pro"
+ },
+ "success": true
+}

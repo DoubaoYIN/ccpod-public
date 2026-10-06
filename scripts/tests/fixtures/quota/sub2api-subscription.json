@@ -1,0 +1,14 @@
+{
+  "isValid": true,
+  "mode": "subscription",
+  "planName": "Claude Pro 套餐",
+  "subscription": {
+    "daily_limit_usd": 5.0,
+    "daily_usage_usd": 1.2,
+    "daily_reset_at": 1790908800,
+    "weekly_limit_usd": 40.0,
+    "weekly_usage_usd": 10.0,
+    "weekly_reset_at": 1791081600,
+    "expires_at": 1767225600
+  }
+}

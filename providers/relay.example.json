@@ -1,0 +1,7 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://your-relay.example.com",
+    "ANTHROPIC_API_KEY": "<REPLACE_WITH_YOUR_KEY>",
+    "ANTHROPIC_API_TOKEN": ""
+  }
+}

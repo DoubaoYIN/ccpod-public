@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""claude-rename — 给 Claude Code 会话设标题（含"按内容自动生成"）
+
+用法:
+  claude-rename <会话id前缀> [新标题]      # 省略标题 = 依据对话内容自动生成
+  claude-rename --dry-run <前缀> [标题]    # 只看会写什么，不落盘
+  claude-rename --model <model> <前缀>     # 指定生成用模型
+
+机制（依据 Claude Code CLI 二进制里的实现）:
+  标题有两种记录，显示优先级 customTitle > aiTitle > summary > firstPrompt:
+    {"type":"custom-title","customTitle":"…","sessionId":"…"}
+    {"type":"ai-title","aiTitle":"…","sessionId":"…"}
+  本工具**只追加 custom-title**——这正是 Claude Code 自己的 saveCustomTitle 做法，
+  所以：① 活跃会话也安全（只追加，不改写已有字节，进程的追加偏移不受影响）
+       ② 没有长度限制（旧版"等长原地改写 ai-title"的限制不复存在）
+       ③ 优先级高于 ai-title，之后 Claude 自动再生成标题也盖不掉它
+  ⚠️ 记录**必须带 sessionId**，否则 Claude Code 读取时直接忽略
+     （读取条件是 `type==="custom-title" && sessionId`）。sessionId 就是文件名。
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+
+SESSIONS_DIR = os.path.expanduser("~/.claude/projects")
+KEY_HELPER = os.path.expanduser("~/.claude/bin/anthropic-key.sh")
+GATEWAY = os.environ.get("CCR_URL", "http://127.0.0.1:3456")
+DEFAULT_MODEL = os.environ.get("CLAUDE_TITLE_MODEL", "bailian/qwen3.8-max")
+HEAD_BYTES = 512 * 1024      # 只读文件头部找前几条用户消息
+MAX_TITLE_CHARS = 40
+MAX_USER_MSG_CHARS = 2000    # 超过这个长度的"用户消息"基本是注入的文档/skill 正文
+
+# 用户消息里常被拼进系统注入块，它们不代表"这次对话在聊什么"。
+# 取第一个标记之前的内容作为真正的用户意图。
+INJECTED = re.compile(
+    r"<\s*(system-reminder|HARD-GATE|EXTREMELY_IMPORTANT|EXTREMELY-IMPORTANT"
+    r"|command-name|command-message|command-args|local-command-stdout"
+    r"|task-notification|cross-session-message|ide_selection|context)",
+    re.IGNORECASE,
+)
+
+
+# 本机实测过的 key 形状：sk-/yessk-（百炼的带 . ）、cr_（某自研站）、ccr-（CCR 本地）、
+# GLM 的 hex.xxx。cr_/ccr- 要求含数字，免得把 ccr-claude-code-… 这类文件名也打码。
+SECRET_PATTERNS = [
+    (re.compile(r"(?<![A-Za-z0-9])((?:yes)?sk-[A-Za-z0-9_\-.]{6})[A-Za-z0-9_\-.]{4,}"), r"\1***REDACTED***"),
+    (re.compile(r"(ark-[a-f0-9\-]{6})[a-f0-9\-]{4,}"), r"\1***REDACTED***"),
+    (re.compile(r"\b(c?cr[_\-][A-Za-z0-9_\-]{6})(?=[A-Za-z0-9_\-]*[0-9])[A-Za-z0-9_\-]{8,}"), r"\1***REDACTED***"),
+    (re.compile(r"\b([0-9a-f]{6})[0-9a-f]{26}\.[A-Za-z0-9]{16}\b"), r"\1***REDACTED***"),
+    (re.compile(r"(Bearer\s+)[A-Za-z0-9_\-.]{12,}"), r"\1***REDACTED***"),
+]
+
+
+def redact(text):
+    """回显前脱敏，与 Swift 侧 SecretRedactor 同一套模式（保留前 6 位便于辨认）。"""
+    for pattern, repl in SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def parse_args(argv):
+    dry, model, pos = False, DEFAULT_MODEL, []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--dry-run":
+            dry = True
+        elif a == "--model":
+            i += 1
+            if i >= len(argv):
+                die("❌ --model 后面要跟模型名")
+            model = argv[i]
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        else:
+            pos.append(a)
+        i += 1
+    if not pos:
+        print(__doc__)
+        sys.exit(1)
+    prefix = pos[0]
+    title = pos[1] if len(pos) > 1 else None
+    return dry, model, prefix, title
+
+
+def locate(prefix):
+    matches = []
+    for root, _dirs, files in os.walk(SESSIONS_DIR):
+        if root.count(os.sep) - SESSIONS_DIR.count(os.sep) > 1:
+            continue
+        for name in files:
+            if name.startswith(prefix) and name.endswith(".jsonl"):
+                matches.append(os.path.join(root, name))
+    if len(matches) != 1:
+        die(f"❌ 匹配到 {len(matches)} 个会话文件（需恰好 1 个）: {matches or '无'}")
+    return matches[0]
+
+
+def first_user_messages(path, limit=3, per_msg=600):
+    """取开头几条真实用户消息，跳过系统注入（reminder / 命令包装 / skill 正文 / 工具结果）。"""
+    out, first_plain = [], None
+    with open(path, "rb") as fh:
+        raw = fh.read(HEAD_BYTES).decode("utf-8", "replace")
+    for line in raw.split("\n"):
+        if len(out) >= limit:
+            break
+        if '"role":"user"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        content = (rec.get("message") or {}).get("content")
+        if isinstance(content, list):
+            content = " ".join(
+                c.get("text", "") for c in content
+                if isinstance(c, dict) and c.get("type") == "text"
+            )
+        if not isinstance(content, str):
+            continue
+        plain = content.strip()
+        if not plain or "tool_result" in plain:
+            continue
+        if first_plain is None:
+            first_plain = plain[:per_msg]
+        # 系统注入的块不是"这次对话在聊什么"，截掉它们再判断
+        # （实测：不截的话 jieqi-farm 那个会话会把 <HARD-GATE> 的英文指令当成用户意图）
+        text = INJECTED.split(content)[0].strip()
+        if not text or text.startswith("<"):
+            continue
+        # skill / slash command 的正文以 user 消息身份注入，动辄上万字，会把标题带偏
+        # （实测：不滤的话抓到的全是 "Base directory for this skill: …"）
+        if text.startswith("Base directory for this skill"):
+            continue
+        if len(text) > MAX_USER_MSG_CHARS:
+            continue
+        out.append(text[:per_msg])
+    # 一条合格的都没有时，退回第一条非空用户消息，至少还有内容可依据
+    return out or ([first_plain] if first_plain else [])
+
+
+def gateway_key():
+    try:
+        key = subprocess.run([KEY_HELPER], capture_output=True, text=True,
+                             timeout=15).stdout.strip()
+    except Exception as exc:
+        die(f"❌ 取网关 key 失败（{KEY_HELPER}）: {exc}")
+    if not key:
+        die("❌ 钥匙串里没有 claude-code-apikey-fun，无法调用网关生成标题")
+    return key
+
+
+def generate_title(path, model):
+    msgs = first_user_messages(path)
+    if not msgs:
+        die("❌ 这个会话开头没有可用的用户消息，无法据内容生成标题；请手动指定标题")
+    convo = "\n".join(f"- {m}" for m in msgs)
+    payload = {
+        "model": model,
+        "max_tokens": 100,
+        # 必须显式关掉思考：qwen3.8-max 默认会先思考，60~100 的 max_tokens 会被
+        # thinking 块吃光，content 里只剩 thinking、没有 text（实测踩过）。
+        "thinking": {"type": "disabled"},
+        "system": ("你是会话标题生成器。依据用户消息判断这次对话在做什么，"
+                   "输出一个不超过 16 个汉字的中文标题。"
+                   "只输出标题本身：不要引号、不要句号、不要解释、不要换行。"),
+        "messages": [{"role": "user", "content": convo}],
+    }
+    req = urllib.request.Request(
+        f"{GATEWAY}/v1/messages",
+        data=json.dumps(payload).encode(),
+        headers={
+            "content-type": "application/json",
+            "x-api-key": gateway_key(),
+            "anthropic-version": "2023-06-01",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read().decode())
+    except Exception as exc:
+        die(f"❌ 网关 {GATEWAY} 调用失败（模型 {model}）: {redact(str(exc))}\n"
+            f"   可以改用手动标题：claude-rename <前缀> \"标题\"")
+    parts = body.get("content") or []
+    text = "".join(p.get("text", "") for p in parts
+                   if isinstance(p, dict) and p.get("type") == "text").strip()
+    text = text.strip("\"'“”‘’《》 \n\t")
+    if not text:
+        kinds = [p.get("type") for p in parts if isinstance(p, dict)]
+        # 原始响应可能把请求头/密钥回显出来，打印前先脱敏
+        die(f"❌ 网关没返回 text 块（返回类型: {kinds or '空'}）。\n"
+            f"   若只有 thinking，说明该模型忽略了 thinking:disabled，"
+            f"换个模型试试：claude-rename --model <model> {prefix}\n"
+            f"   原始响应: {redact(json.dumps(body, ensure_ascii=False)[:300])}")
+    return text[:MAX_TITLE_CHARS], model, convo
+
+
+def append_custom_title(path, title, session_id):
+    """单次 O_APPEND 写入一行——与 Claude Code 自己的 saveCustomTitle 同款做法。"""
+    rec = json.dumps({"type": "custom-title", "customTitle": title,
+                      "sessionId": session_id}, ensure_ascii=False,
+                     separators=(",", ":")) + "\n"
+    with open(path, "rb+") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        prefix_nl = b""
+        if size > 0:
+            fh.seek(size - 1)
+            if fh.read(1) != b"\n":
+                prefix_nl = b"\n"   # 上一行没收尾，先补换行，别把记录粘到它后面
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, prefix_nl + rec.encode())
+    finally:
+        os.close(fd)
+
+
+def verify(path, title):
+    """回读尾部，确认 Claude Code 的读取条件（同行含 type 与 sessionId）真的成立。
+
+    必须是**最后一条** custom-title：从尾部找到第一条就返回的话，
+    "本次写入其实失败、但这个标题历史上设过"会被误报成成功。
+    """
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        fh.seek(max(0, size - 65536))
+        tail = fh.read().decode("utf-8", "replace")
+    for line in reversed(tail.split("\n")):
+        if '"type":"custom-title"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        return rec.get("customTitle") == title and bool(rec.get("sessionId"))
+    return False
+
+
+def main():
+    dry, model, prefix, title = parse_args(sys.argv[1:])
+    path = locate(prefix)
+    session_id = os.path.basename(path)[:-len(".jsonl")]
+    print(f"会话文件: {path}")
+    print(f"sessionId: {session_id}")
+
+    generated_from = None
+    if title is None:
+        title, model, convo = generate_title(path, model)
+        generated_from = convo
+        print(f"生成模型: {model}")
+        print("依据的用户消息:")
+        for line in convo.split("\n"):
+            print(f"  {line[:120]}")
+    title = title.strip()
+    if not title:
+        die("❌ 标题为空")
+    if len(title) > MAX_TITLE_CHARS:
+        print(f"⚠️ 标题超过 {MAX_TITLE_CHARS} 字，已截断")
+        title = title[:MAX_TITLE_CHARS]
+
+    if dry:
+        print("\n[dry-run] 将追加:")
+        print(json.dumps({"type": "custom-title", "customTitle": title,
+                          "sessionId": session_id}, ensure_ascii=False))
+        return
+
+    append_custom_title(path, title, session_id)
+    if not verify(path, title):
+        die(f"❌ 写入后回读校验失败，请检查 {path}")
+    print(f"\n✅ 标题已设定: {title}")
+    if generated_from is not None:
+        print("   （依据内容自动生成；不满意可直接再跑一次并手动指定标题）")
+    print("   claude --resume 列表与 ccpod 会话卡都会显示它；"
+          "正在运行的会话要等下次读取 transcript 时才刷新。")
+
+
+if __name__ == "__main__":
+    main()

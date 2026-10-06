@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>CCPod</string>
+    <key>CFBundleDisplayName</key>
+    <string>CCPod</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.ccpod.menubar</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.2.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>CCPodMenuBar</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <!-- CCR 网关 /health 是本机明文 HTTP（127.0.0.1:3456），ATS 默认拦截 -->
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>CCPod 使用 Apple Events 在终端中启动 ccstart。</string>
+</dict>
+</plist>

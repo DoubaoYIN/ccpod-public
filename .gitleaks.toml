@@ -1,0 +1,7 @@
+# 已知的合成测试 key（测试脱敏/探测逻辑用的假样本，非真实凭证）
+[allowlist]
+  description = "synthetic test keys"
+  paths = [
+    '''scripts/tests/test_ccmodel_probe\.sh''',
+    '''scripts/tests/gateway_lines\.swift''',
+  ]

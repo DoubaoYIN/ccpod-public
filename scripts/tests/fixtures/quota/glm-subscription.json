@@ -1,0 +1,37 @@
+{
+ "code": 200,
+ "msg": "操作成功",
+ "data": [
+  {
+   "id": "REDACTED",
+   "customerId": "REDACTED",
+   "agreementNo": "REDACTED",
+   "orderNo": "REDACTED",
+   "productId": "REDACTED",
+   "productName": "GLM Coding Pro",
+   "description": "GLM Coding Pro",
+   "status": "VALID",
+   "purchaseTime": "2026-08-11 15:47:00",
+   "valid": "2026-11-11 10:00:00-2027-02-11 10:00:00",
+   "autoRenew": 1,
+   "initialPrice": 1614.0,
+   "standardPrice": 1614.0,
+   "useInitialPrice": false,
+   "actualPrice": 1291.2,
+   "renewPrice": 1291.2,
+   "currentPeriod": 2,
+   "currentRenewTime": "2026-08-11",
+   "nextRenewTime": "2026-11-11",
+   "paymentType": "WAIT_PAY",
+   "billingCycle": "quarterly",
+   "inCurrentPeriod": true,
+   "paymentChannel": "ALI",
+   "refundable": false,
+   "refundableReason": "RATE_LIMITED",
+   "banStatus": 0,
+   "banExpireTime": null,
+   "version": "V3"
+  }
+ ],
+ "success": true
+}

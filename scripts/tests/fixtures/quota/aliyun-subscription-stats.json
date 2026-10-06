@@ -1,0 +1,14 @@
+{
+  "Success": true,
+  "RequestId": "unit-test",
+  "Data": {
+    "SeatCredits": 11500,
+    "SeatRemainingCredits": 9230,
+    "SeatRefreshTime": 1790935200,
+    "SeatType": "Lite",
+    "SubscriptionStartTime": 1786528800,
+    "SubscriptionEndTime": 1789120800,
+    "AssignedSeats": 1,
+    "TotalSeats": 1
+  }
+}

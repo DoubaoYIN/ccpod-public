@@ -1,0 +1,16 @@
+#!/bin/sh
+# ccpod-sleep-switch — CCPod「合盖保持唤醒」的 root helper。
+# 经 /etc/sudoers.d/ccpod-sleep-switch 免密放行，只接受固定参数，无输入拼接。
+#
+# 为什么用 -a 不用 -b（2026-10-06 实测，macOS 27 / arm64）：
+# `pmset -b disablesleep 1` 是运行时临时覆盖，不写入任何电源配置档位
+# （pmset -g custom 两档均无此项），在 AC 下设置后拔线即丢失——
+# 「插着电开开关、拔线走人」的场景会静默失效。`-a` 写入全档位，双向拔插实测存活。
+set -eu
+
+case "${1:-}" in
+  on)     /usr/bin/pmset -a disablesleep 1 ;;
+  off)    /usr/bin/pmset -a disablesleep 0 ;;
+  status) /usr/bin/pmset -g | /usr/bin/awk '/SleepDisabled/ { print $2; found=1; exit } END { if (!found) exit 1 }' ;;
+  *) echo "usage: ccpod-sleep-switch on|off|status" >&2; exit 1 ;;
+esac

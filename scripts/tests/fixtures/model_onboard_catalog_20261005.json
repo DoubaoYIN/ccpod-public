@@ -1,0 +1,205 @@
+{
+ "captured_at": "2026-10-05T20:15:19",
+ "note": "只含模型名，不含任何密钥；listed=网关清单，catalog=上游目录",
+ "lines": {
+  "dragoncode": {
+   "listed": [
+    "claude-opus-5-5",
+    "claude-sonnet-5",
+    "claude-haiku-4-5-20251001",
+    "claude-fable-5",
+    "claude-fable-5-1"
+   ],
+   "catalog": [
+    "claude-2.0",
+    "claude-2.1",
+    "claude-3-5-haiku-20241022",
+    "claude-3-5-sonnet-20240620",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-7-sonnet-20250219",
+    "claude-3-haiku-20240307",
+    "claude-3-opus-20240229",
+    "claude-3-sonnet-20240229",
+    "claude-fable-5",
+    "claude-fable-5-1",
+    "claude-haiku-4-5-20251001",
+    "claude-instant-1.2",
+    "claude-opus-4-1-20250805",
+    "claude-opus-4-20250514",
+    "claude-opus-4-5-20251101",
+    "claude-opus-4-5-thinking",
+    "claude-opus-4-6",
+    "claude-opus-4-6-thinking",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-opus-5-5",
+    "claude-sonnet-4-20250514",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-5-20250929",
+    "claude-sonnet-4-5-thinking",
+    "claude-sonnet-4-6",
+    "claude-sonnet-5",
+    "claude-sonnet-5-5"
+   ]
+  },
+  "yescode": {
+   "listed": [
+    "claude-fable-5",
+    "claude-opus-5-5",
+    "claude-sonnet-5",
+    "claude-haiku-4-5",
+    "claude-fable-5-1",
+    "claude-sonnet-5-5"
+   ],
+   "catalog": [
+    "claude-fable-5",
+    "claude-fable-5-1",
+    "claude-haiku-4-5",
+    "claude-haiku-4-5-20251001",
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-opus-5-5",
+    "claude-sonnet-4-6",
+    "claude-sonnet-5",
+    "claude-sonnet-5-5",
+    "codex-auto-review",
+    "deep-research-preview",
+    "deep-think-preview",
+    "gemini-2.5-pro",
+    "gemini-3-flash-preview",
+    "gemini-3-pro-image",
+    "gemini-3.1-flash-image",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-pro-preview-customtools",
+    "gemini-3.5-flash",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+    "gemini-omni-flash-preview",
+    "gpt-5.5",
+    "gpt-5.6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-6-astra",
+    "gpt-image-1024x1024",
+    "gpt-image-1024x1536",
+    "gpt-image-1536x1024",
+    "gpt-image-2",
+    "grok-4.5",
+    "grok-4.6",
+    "veo-3.1-fast-generate-preview",
+    "veo-3.1-generate-preview",
+    "veo-3.1-lite-generate-preview"
+   ]
+  },
+  "kimi": {
+   "listed": [
+    "kimi-for-coding",
+    "k3",
+    "kimi-for-coding-highspeed",
+    "k3-256k"
+   ],
+   "catalog": [
+    "kimi-for-coding",
+    "kimi-for-coding-highspeed",
+    "k3",
+    "k3-256k"
+   ]
+  },
+  "glm": {
+   "listed": [
+    "glm-5.2",
+    "glm-5.3",
+    "glm-5.3-flash"
+   ],
+   "catalog": [
+    "glm-4.5",
+    "glm-4.5-air",
+    "glm-4.6",
+    "glm-4.7",
+    "glm-5",
+    "glm-5-turbo",
+    "glm-5.1",
+    "glm-5.2",
+    "glm-5.3",
+    "glm-5.3-flash",
+    "glm-5.3-flashx"
+   ]
+  },
+  "bailian": {
+   "listed": [
+    "qwen3.8-max",
+    "qwen3.8-flash",
+    "qwen3.6-flash",
+    "qwen3.7-max",
+    "qwen3.7-plus",
+    "glm-5.2",
+    "glm-5.3",
+    "deepseek-v4-pro",
+    "deepseek-v4.1-flash"
+   ],
+   "catalog": [
+    "qwen3.7-max",
+    "qwen3.7-plus",
+    "qwen3.6-flash",
+    "glm-5.2",
+    "deepseek-v4-pro",
+    "wan2.7-image",
+    "wan2.7-image-pro",
+    "qwen-audio-3.0-tts-plus",
+    "deepseek-v4-flash-0731",
+    "qwen3.8-max",
+    "qwen-audio-3.0-realtime-plus",
+    "qwen3.8-flash",
+    "deepseek-v4.1-flash",
+    "glm-5.3",
+    "auto",
+    "decision-model-preview"
+   ]
+  },
+  "dragon-grok": {
+   "listed": [
+    "grok-4.6",
+    "grok-4.7"
+   ],
+   "catalog": [
+    "grok-4.7",
+    "grok-4.6",
+    "grok-4.5",
+    "grok-4.3",
+    "grok-build-0.1",
+    "grok-composer-2.5-fast",
+    "grok-4.20-0309-reasoning",
+    "grok-4.20-0309-non-reasoning",
+    "grok-4.20-multi-agent-0309",
+    "grok-imagine-image-quality",
+    "grok-imagine-image",
+    "grok-imagine-video",
+    "grok-imagine-video-1.5-preview",
+    "grok-imagine-video-1.5"
+   ]
+  },
+  "aigocode": {
+   "listed": [
+    "claude-opus-5-5",
+    "claude-fable-5",
+    "claude-fable-5-1",
+    "claude-sonnet-5",
+    "claude-opus-4-8",
+    "claude-haiku-4-5-20251001"
+   ],
+   "catalog": [
+    "claude-opus-4-8",
+    "claude-haiku-4-5-20251001",
+    "claude-fable-5-1",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-fable-5",
+    "claude-sonnet-5"
+   ]
+  }
+ }
+}
