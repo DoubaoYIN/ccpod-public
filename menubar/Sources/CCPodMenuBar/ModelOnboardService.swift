@@ -428,7 +428,8 @@ enum ModelOnboardService {
 
     // MARK: - 账本（只读）
 
-    private static func withLedger<T>(_ body: (OpaquePointer) -> T?) -> T? {
+    /// RoutingLeakService 也用这两把（只读打开，同一份账本）
+    static func withLedger<T>(_ body: (OpaquePointer) -> T?) -> T? {
         var db: OpaquePointer?
         guard sqlite3_open_v2(usageDB, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db else {
             sqlite3_close(db)
@@ -439,7 +440,7 @@ enum ModelOnboardService {
         return body(db)
     }
 
-    private static func query(_ db: OpaquePointer, _ sql: String, _ argument: String, columns: Int32) -> [[String]]? {
+    static func query(_ db: OpaquePointer, _ sql: String, _ argument: String, columns: Int32) -> [[String]]? {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
         defer { sqlite3_finalize(statement) }

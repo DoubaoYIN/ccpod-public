@@ -334,16 +334,19 @@ detect_terminal() {
 # in the same shell (critical for one-click provider switch).
 # Usage: eval "$(get_provider_env easyclaude)"
 get_provider_env() {
-  local name="$1"
+  local name="$1" model_override="${2:-}"
   local prov="$CCPOD_PROVIDERS_DIR/${name}.json"
   [[ -f "$prov" ]] || die "未知 provider: $name"
   require_cmd python3
-  python3 - "$prov" "$(dirname "${BASH_SOURCE[0]}")" "$CCPOD_PROVIDERS_DIR" <<'PYEOF'
+  python3 - "$prov" "$(dirname "${BASH_SOURCE[0]}")" "$CCPOD_PROVIDERS_DIR" "$model_override" <<'PYEOF'
 import json, os, re, sys, shlex
 data = json.load(open(sys.argv[1]))
 sys.dont_write_bytecode = True
 sys.path.insert(0, sys.argv[2])
 import line_models
+# 启动时一次性的 --model（ccgo / 菜单栏「启动新会话」）：只改这次的副本，不写文件
+if sys.argv[4]:
+    data = line_models.apply_overrides(data, sys.argv[3], model=sys.argv[4])
 
 def resolve_env_value(v):
     # {"$exec": "cmd"} → 取命令 stdout（如从钥匙串取 key，避免明文落 json）。
@@ -359,7 +362,7 @@ def resolve_env_value(v):
     return v
 
 env = {k: resolve_env_value(v) for k, v in (data.get("env", {})).items()}
-# 网关管线：主模型必须还在管线里，五个档位钉到本管线（见 line_models.py 文件头）
+# 网关管线：主模型必须还在管线里，五个档位钉到本管线，子代理档走全局默认模型（见 line_models.py 文件头）
 plan = line_models.plan(data, sys.argv[3])
 if plan:
     env["ANTHROPIC_MODEL"] = plan["route"]
@@ -367,10 +370,19 @@ if plan:
         env.setdefault(k, v)
     if plan["notice"]:
         print(f"⚠️  {plan['notice']}", file=sys.stderr)
+# 自动压缩窗口安全网（所有线路，PITFALLS #58）：线路 env 自己写了按线路的；"off" 时显式 unset
+window, window_warning = line_models.auto_compact_window(data, sys.argv[3])
+if window_warning:
+    print(f"⚠️  {window_warning}", file=sys.stderr)
+if window:
+    env.setdefault(line_models.AUTO_COMPACT_KEY, window)
 all_keys = {"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_API_TOKEN",
             "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_BASE_URL", "CLAUDE_AGENT_API_BASE_URL",
             "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_API_KEY",
-            "CLAUDE_CODE_API_KEY", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"}
+            "CLAUDE_CODE_API_KEY", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+            # 直连线路/读不到全局默认模型时必须显式 unset：open -a 会把父环境整份带进新终端（PITFALLS #9b），
+            # 不清掉就会继承别的会话留下的子代理档 / 压缩窗口
+            line_models.SUBAGENT_KEY, line_models.AUTO_COMPACT_KEY}
 all_keys.update(k for k in os.environ if k.startswith(("ANTHROPIC_DEFAULT_", "CCR_", "CODEXL_")))
 all_keys.update(env.keys())
 for k in sorted(all_keys):
@@ -386,26 +398,51 @@ PYEOF
 }
 
 get_provider_claude_args() {
-  local name="$1"
+  local name="$1" model_override="${2:-}" effort_override="${3:-}"
   local prov="$CCPOD_PROVIDERS_DIR/${name}.json"
   [[ -f "$prov" ]] || die "未知 provider: $name"
   require_cmd python3
-  python3 - "$prov" "$(dirname "${BASH_SOURCE[0]}")" "$CCPOD_PROVIDERS_DIR" <<'PYEOF'
+  python3 - "$prov" "$(dirname "${BASH_SOURCE[0]}")" "$CCPOD_PROVIDERS_DIR" "$model_override" "$effort_override" <<'PYEOF'
 import json, sys
 data = json.load(open(sys.argv[1]))
-args = data.get("claude_args", [])
-if not isinstance(args, list) or not all(isinstance(x, str) for x in args):
-    raise SystemExit("claude_args must be a string array")
 sys.dont_write_bytecode = True
 sys.path.insert(0, sys.argv[2])
 import line_models
+# 启动时一次性的 --model / --effort：只改这次的副本，不写文件
+if sys.argv[4] or sys.argv[5]:
+    data = line_models.apply_overrides(data, sys.argv[3], model=sys.argv[4] or None, effort=sys.argv[5] or None)
+args = data.get("claude_args", [])
+if not isinstance(args, list) or not all(isinstance(x, str) for x in args):
+    raise SystemExit("claude_args must be a string array")
 plan = line_models.plan(data, sys.argv[3])
 if plan:
     args = line_models.rewrite_model_arg(args, plan["route"])
+level, warning = line_models.effort(data, sys.argv[3])
+if warning:
+    print("⚠️  " + warning, file=sys.stderr)
+if level and not any(a == "--effort" or a.startswith("--effort=") for a in args):
+    args = args + ["--effort", level]
 for arg in args:
     if "\n" in arg or "\0" in arg:
         raise SystemExit("invalid claude_args value")
     print(arg)
+PYEOF
+}
+
+# 启动时一次性的 --model / --effort（ccgo）：在记项目偏好、同步配置目录这些副作用之前先校验，出错说清原因
+check_launch_overrides() {
+  local name="$1" model_override="${2:-}" effort_override="${3:-}"
+  [[ -n "$model_override" || -n "$effort_override" ]] || return 0
+  local prov="$CCPOD_PROVIDERS_DIR/${name}.json"
+  [[ -f "$prov" ]] || die "未知 provider: $name"
+  require_cmd python3
+  python3 - "$prov" "$(dirname "${BASH_SOURCE[0]}")" "$CCPOD_PROVIDERS_DIR" "$model_override" "$effort_override" <<'PYEOF'
+import json, sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[2])
+import line_models
+line_models.apply_overrides(json.load(open(sys.argv[1])), sys.argv[3],
+                            model=sys.argv[4] or None, effort=sys.argv[5] or None)
 PYEOF
 }
 
@@ -792,6 +829,18 @@ try:
         data.append(rec)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         atomic_write(path, json.dumps(data, indent=2))
+        # 启动记录（菜单栏管线区按「近 7 天启动次数」排序用；直连线路不经网关、网关账本里没有它们）。
+        # 记录失败不影响会话登记；超过 2000 行时只留最近 1000 行。
+        try:
+            log_path = os.path.join(os.path.dirname(path), "ccpod-launch-log.jsonl")
+            with open(log_path, "a") as lf:
+                lf.write(json.dumps({"at": int(time.time()), "provider": rec["provider"]}) + "\n")
+            with open(log_path) as lf:
+                lines = lf.readlines()
+            if len(lines) > 2000:
+                atomic_write(log_path, "".join(lines[-1000:]))
+        except OSError:
+            pass
         print(num)
 except (OSError, ValueError) as exc:
     print(f"ccpod 会话登记失败：{exc}", file=sys.stderr)

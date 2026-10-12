@@ -8,6 +8,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Nightwatch 夜间守门人：无人值守时会话不停摆**（PITFALLS #59，`docs/nightwatch.md`）：`ccnight on` 后 PreToolUse hook 对
+  AskUserQuestion / ExitPlanMode 输出 `deny`+引导词（模型收理由继续回合，不再像 #279 那样冻结 6 小时），问题脱敏落盘
+  `~/.claude/nightwatch/asks/`，晨间 `ccnight morning` 聚合批答；Notification / StopFailure 只观测落盘。三红线：hook 永不代答
+  （不输出 allow/updatedInput）、授权只可预先生产、push/装机/系统级夜间永久冻结待晨。hook 崩溃/超时 = fail-open 问题照弹
+  回到现状不会更坏（真会话实测 UI 照常弹出）。安装 `scripts/nightwatch/install.sh`（幂等合并 3 组 hooks 进全局 settings，
+  ccgo 启动整份同步自动传播到各线路）；自检 `ccnight doctor`（含 provider 残留检出）与 ccdoctor Nightwatch 节（未安装=中性）。
+  离线单测 `scripts/tests/test_nightwatch.sh` 11 节 + 真 tmux 会话实测 deny 链/fail-open/防循环/HIDIdle/脱敏全过。
+- **优惠雷达**：在「管线管理」里给某条 gateway 管线填一个厂商公开的定价/活动页网址，ccpod 每天 21:00 抓一次、
+  21:30 汇总提醒。菜单栏 popover 一行说清「现在能省什么 / 哪页读不到」，面板窗口分「生效中 / 即将开始 / 已过期」三节，
+  每条都带**原文摘录**和来源链接。
+  - **只提醒，不动任何配置**：不切线路、不改 settings、不碰 CCR。面板里没有任何按钮会写配置文件。
+  - 情报分两级：**A 类峰谷定价**（官方页字面写着、可核实）才弹通知；**B 类限时活动**（易变、信源杂）
+    只在面板里露脸并标 ❓，**永远不弹通知**。
+  - 失败可见：页级四态（`ok` / 抓不到 / 要 JavaScript / 读不出优惠）各有一句大白话和一份证据
+    （HTTP 码、可见字符数、错误原文、`note`）。「今天没优惠」和「页读不到」在界面上绝不长一个样。
+  - 出网口径：只做无头 HTTP GET，**不跑浏览器、不执行 JavaScript**，不带任何凭证。详见 `docs/SECURITY.md`。
+  - 首条规则覆盖阿里云百炼的 DeepSeek 系列闲时 5 折（22:00–次日 08:00 北京时间）。规则在 `scripts/promo-rules.json`，
+    改规则不用重编译 App。
+  - 设计 `docs/superpowers/specs/2026-10-10-promotion-radar-design.md`；实现计划
+    `docs/superpowers/plans/2026-10-10-promotion-radar.md`。
+- **启动新会话时可选这一次的模型和思考强度**：「启动新会话」表单在「管线」下多一行「模型 / 思考」，默认跟管线走；
+  选了别的只用于这一次（不写任何文件，启动后回到默认，会话菜单「重启」仍按管线默认）。实现是 `ccgo` 新增
+  `--model` / `--effort`（`line_models.apply_overrides`）：模型必须在管线清单里、档位必须合法，否则在启动 claude
+  之前就报错（PITFALLS #43）；直连线路只能改思考强度。不传参数时启动行为与改动前逐字节相同（本机全部线路比对过）。
+  设计 `docs/superpowers/specs/2026-10-09-launch-model-effort-design.md`。⚠️ 表单点击未实机点验。
+- **大上下文冷读 524 的两道防线**（PITFALLS #58，`docs/lessons/2026-10-09-large-context-cold-read-524.md`）：Claude Code 10-05 升到 2.1.289 后
+  把 opus-5-5 / fable-5-1 当 1M 窗口，自动压缩点从 16.8 万悄悄挪到约 97 万；会话涨到 40 万后缓存一冷（闲置 > 5 分钟），下一次请求首字节
+  超过中转站 Cloudflare 的 100 秒就被掐成 524，Claude Code 原样重试 10 次，窗口"卡死" 2–20 分钟（10-09 一天 24 次）。
+  - `scripts/ccpod-rescue.py <session-id>`：**不经过模型**的解卡——把会话文件做一份副本，旧工具输出换成占位符（上下文 90% 是工具输出，
+    用户原话 + 拍板 < 2%），新窗口 `--resume` 副本。实测 fable 42 万 → 19.3 万，12 秒返回，准确引用用户最后一句原话。只读原文件、副本 0600、不覆盖。
+  - 自动压缩窗口安全网：ccgo 对所有线路按会话注入 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=300000`（线路文件 `auto_compact_window` 可改或 `"off"`；
+    线路 env 自己写了按线路的；绝不进 settings env）。这是兜底不是主方案——有损，且在该会话里锁住 `/autocompact`。只对新开的会话生效。
+  - `ccdoctor` 新增「压缩窗口」段：settings env 里不许有该键；运行中的 claude 进程缺它的列出 pid（重启即可带上）；正面证据的手动取法。
+  - 不采用：1 小时提示缓存（relay-a 实测不兑现）、定时保温（贵且同样靠中转站兑现）。
+- **子代理默认走全局默认模型，不再被网关静默换掉**（`scripts/lib/line_models.py` 的 `subagent_model()`，PITFALLS #57）：
+  CCR 3.1.1 对 Claude Code 子代理请求不看客户端指定的模型、一律送 profile 主模型（GLM），钉在本管线的 Opus 照样被换且会话里仍显示 Opus
+  （09-26 起累计约 640 条，10-09 一天 435 条）。现在 ccgo 启动网关管线会话时把 `CLAUDE_CODE_SUBAGENT_MODEL` 写成主 settings 的
+  全局默认模型（去掉 `[1m]`）：请求本身就写 GLM，标签天然真实。线路 env 自己写了该键按线路的来；直连线路不设；
+  读不到或不是「厂商/模型」形态就不设并在终端提示。只对新开的会话生效。
+  `ccdoctor` 新增两条：换模列表下面说明子代理来源；任何 settings 的 env 里出现该键就告警（会盖掉所有管线并热加载进运行中会话）。
+- **菜单栏盯网关换模**（`RoutingLeakService` / `RoutingLeakPolicy`）：每半小时只读 CCR 账本，近 24 小时「请求模型 ≠ 实际路由」的
+  真实会话请求在线路区常显一行橙字；新出现的最多每 6 小时推一次系统通知。这事从 09-26 就开始、两周没人看见，根因是 ccdoctor 要人手动跑。
+- **管线默认思考强度**：管线管理里「默认模型」下面加「思考强度」（跟随全局 / low … max），存为线路文件的 `effort`；
+  `ccgo`/`ccstart`/切线路重启都带 `--effort`（`scripts/lib/line_models.py` 的 `effort()`，别名线路跟所属管线）。
+  刷新管线时保留该设置；非法值启动时在终端提示并忽略。刻意不用 `CLAUDE_CODE_EFFORT_LEVEL`：环境变量会锁死 `/effort`，
+  写进 settings env 后还会残留在运行中的会话里（PITFALLS #56）。实测（2.1.289，本地截获 API 请求）：`--effort max/xhigh/low`
+  原样出现在 `output_config.effort`；同一会话先 `/effort high` 再提问，`--effort max` 的请求变成 high，环境变量的仍是 max。
+- **会话菜单「重启」**：原来「切换到 <当前线路>」点了什么都不做；现在对同线路写带 sessionId 的 pending，
+  ccgo 以原线路 `--resume` 重启，套用线路当前的默认模型和思考强度、换掉旧进程的环境残留。会中断正在进行的回复。
+  E2E 测试覆盖 pending → 重启 → 同号 → 带上新 `--effort`；菜单点击本身 ⚠️ 未实机点验。
+- **点会话行直接切到那个终端窗口**（`TerminalAdapter.focusSession`）：弹窗里的会话行整行可点，
+  iTerm2 / Terminal.app 按分屏的 `tty` 精确定位（`select` 分屏→标签页→窗口，先取消最小化，再 `activate`）；
+  Ghostty 的分屏没有 tty 属性，按 session-hud hook 写上去的分屏标题匹配，兜底按工作目录且只认唯一命中。
+  只对**在运行的**终端发脚本（`tell` 没在跑的 App 会把它拉起来），登记的终端优先、收编/直接启动行轮询其余终端；
+  没有 TTY 的「后台」行不挂点击。行内的重命名/关闭按钮与线路菜单按设计各自响应（⚠️ 未实机点验）。
+- **添加管线更顺手、同厂商多账号分得清**（`8efccee`，10-08）：弹窗线路区「➕ 添加」和「…」菜单「添加管线…」直接弹出添加表单；
+  默认名 `厂商-计费模式`（`volcengine-payg`…，切计费模式跟着变，重名加 `-2`）；名称可写中文（存 `display_name`，ID 自动生成）；
+  报错区固定在按钮上方、可滚动复制。管线管理每行显示 **key 指纹**（SHA256 前 6 位，`KeyFingerprint`），添加时提示
+  「这把 key 已用在 X / 同厂商已有别的 key」（多账号多 key 的预案，PITFALLS #52）。删线路时连带删它专属的钥匙串条目
+  `ccpod-line-<名>`（别的线路还在引用就不删）。火山 `ModelNotOpen` 译成「账号没开通该模型」。
+- **弹窗「管线」区改名「线路状态」，并列出直连线路**（`8efccee`）：原来只列网关线路，火山/MiniMax/DeepSeek 这些直连线路看不到。
+  排序按近 7 天**启动次数**（`scripts/lib/common.sh` 每次 ccgo 登记时追加一行到 `~/.claude/ccpod-launch-log.jsonl`），
+  次数相同再比网关近 7 天请求数。报错默认收起，只挂 ⚠️，点开才看全文。错误诊断窗口顶部自动列出线路问题，可「填入诊断」。
+  ⚠️ 界面**未实测**。
 - **新模型发现（自动上架第一期，只发现不上架）**（`ModelOnboardPolicy` / `ModelOnboardService`）：每轮周期实测后顺带拉各线路的
   上游模型目录，找出「比网关清单里同系列更新」的模型，写进 `~/.claude/ccpod-model-onboard-round.json`（600），弹窗和 `ccdoctor`
   都会提示。带日期的变体、图像/语音/视频模型、预览版、版本号有歧义的（4.20 对 4.7）、清单里没有的新系列一律不算。
@@ -25,6 +89,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   单测 `test_preflight_import.sh` 11 组。⚠️ 导入窗口的实机走查**未实测**。
 
 ### Fixed
+- **`ccdoctor` 读不到 CCR 账本时会崩**：`warn "…跳过（$usage_db）"` 变量紧跟全角括号（PITFALLS #10），
+  bash 3.2 + `set -u` 下报 `usage_db�: unbound variable` 退出 127；改成 `${usage_db}`。只在没有账本/sqlite3 时触发，
+  所以本机一直没暴露（公开版用户没装 CCR 就会撞上）。全仓 shell 扫描已清零。
+- **线路状态审查修复**（10-09；审查清单先逐条对照代码复核，不成立的条目没动）：
+  - 测通结论带上「多久以前测的」（`AgeText`，和额度更新时间用同一套说法；额度原来超过一天还写「50 小时前更新」）；
+  - 周期实测「新结论盖旧结论」（`LineAutoProbePolicy.resultUpdate`）：测通了，之前的失败（含手动测出的）作废；还没通就刷新时间；
+    本轮进行中手动测出的结论不碰；从没通过的线路（只认 Claude Code 客户端的中转站）不额外挂 ⚠️；
+  - 周期实测总结点名没通的线路（「自动实测 5/7 通，没通：Relay-A、Relay-S」），原来只有「5/7 通」；
+  - 测通超过 2 分钟被停时说「探测超时」，原来显示「探测输出解析失败」，像脚本坏了；
+  - 「今日网关用量」每次展开都重新取：原来只取一次，之后一直是旧数，过了午夜还把昨天的数标成「今日」；
+  - 网关体检没跑成时，直连线路和「重新体检 / 管线管理 / 添加」按钮照常显示（原来整块换成一句报错，按钮也一起没了）；
+  - 「编辑此线路」直接弹出这条线路自己的编辑框（原来只打开整个管线管理窗口）；网关线路原来「设置」和「编辑此线路」
+    两个按钮并排、去处不同，合成一个；
+  - 直连线路的说明改成大白话（直连 = Claude Code 直接连厂商；「添加管线」加的都是直连）；网关线路展开后显示排序依据；
+  - 错误诊断窗口也收直连线路的 ⚠️（原来只收测通失败）。
+  单测：`test_line_auto_probe.sh` 新增 13 项、新增 `test_age_text.sh` 11 项，都做过变异测试（把代码改坏能报 FAIL）。⚠️ 界面**未实测**。
 - **线路编辑器 / 档位编辑器保存时不再整份覆盖**（`EditorDelta`）：原来把窗口打开时的快照写回网关，窗口开着期间别处的改动会被
   静默回滚——新加的模型被抹掉、删掉的被复活、轮换过的 key 被改回旧的；档位编辑器还会把「没设置、只是界面默认显示第一项」的
   档位写进去。现在只把本窗口里实际改动的部分叠加到保存那一刻新鲜读到的配置上；什么都没改就不写网关
@@ -126,6 +206,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ccdoctor`「网关路由」段（`a660dec`）**：近 24 小时 CCR 账本里「请求的模型 ≠ 实际路由」逐条列出（只读、warn）。
 
 ### Changed
+- **添加表单的 🔑 说明改成「第一句说填什么 key」+ 可展开**（`fc54ad0` + 本次）：表单默认只显示第一句（到第一个「。」），
+  点「详细说明…」展开其余；换厂商、换计费模式重新收起。火山三种计费模式由 #270 改成大白话（为什么会出现 Kimi/GLM 等别家名字
+  紧接着说明）；其余 19 条统一成同一格式，模型名、地址、实测日期原样保留，notes 里标了「未实测」的也写进表单可见的说明。
+  起因：用户在火山表单里看到大段小字和 Kimi 字样看不懂（10-09）。⚠️ 界面未实测。
 - 菜单栏图标换成 SF Symbol `terminal` + 会话数（0 个会话只显示图标）。
 - 菜单栏使用管线名称；默认优先 Opus，其他管线按旗舰/版本规则选型。旧逐模型入口及历史网关入口隐藏兼容，保留原额度引用与在运行会话。
 - 无密钥网关线路也使用隔离设置并保留 `apiKeyHelper`；`ccstart` 与 `ccgo` 均透传固定模型参数。
@@ -143,6 +227,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - MiniMax → `MiniMax-M2.7`（文档调查，无 key 未实测）
 
 ### Security
+- **错误诊断发给诊断模型之前先脱敏**（`SecretRedactor`，10-09）：原来只在存历史时脱敏，发出去的是原文；
+  用户粘贴的报错、「填入诊断」带进去的线路报错都可能含 key。
 - 沿用接续前的交接包脱敏修复：写盘前脱敏、目录 700 / 文件 600；补充 Relay-S、GLM 与本地网关 token 形状。
 - 添加、编辑、导入共用钥匙串外置与原子写入；覆盖 API token 和嵌套凭据，新增入口不回显密钥。
 

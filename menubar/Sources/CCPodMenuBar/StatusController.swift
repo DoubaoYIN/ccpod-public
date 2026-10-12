@@ -8,7 +8,14 @@ final class StatusController: NSObject {
     private let projectManager = ProjectManager()
     let gatewayService = CCRGatewayService()
     let lineCheckService = LineCheckService()
+    /// 优惠雷达。单例，popover 摘要行和面板窗口读同一份 @Published。
+    let promotionService = PromotionService.shared
+    private var promotionRadarWindow: NSWindow?
     private var popover: NSPopover?
+    // 常驻自管外点兜底监视器（#265 第二脏源）：句柄只在 start() 装一次、stop() 卸，
+    // 弹窗生命周期内不装不卸——从构造上消除漏挂/重复挂/卸载时序三类风险。
+    private var outsideMonitorGlobal: Any?
+    private var outsideMonitorLocal: Any?
     private let vm = PopoverViewModel()
     private var projectManagerWindow: NSWindow?
     private var providerManagerWindow: NSWindow?
@@ -61,43 +68,59 @@ final class StatusController: NSObject {
         }
         projectManager.start()
 
-        vm.onLaunch = { [weak self] provider, project, terminal in
-            self?.popover?.close()
-            self?.doLaunch(provider: provider, project: project, terminalName: terminal)
+        vm.onLaunch = { [weak self] provider, project, terminal, model, effort in
+            self?.closePopoverNow()
+            self?.doLaunch(provider: provider, project: project, terminalName: terminal, model: model, effort: effort)
         }
         vm.onSwitch = { [weak self] session, target in
-            self?.popover?.close()
+            self?.closePopoverNow()
             self?.doSwitch(session: session, target: target)
         }
         vm.onRecover = { [weak self] session, target in
-            self?.popover?.close()
+            self?.closePopoverNow()
             self?.doRecoverInNewWindow(session: session, target: target)
         }
         vm.onClose = { [weak self] session in
             self?.doClose(session: session)
         }
         vm.onRename = { [weak self] session in
-            self?.popover?.close()
+            self?.closePopoverNow()
             self?.doRename(session: session)
+        }
+        vm.onFocus = { [weak self] session in
+            self?.closePopoverNow()
+            self?.doFocus(session: session)
         }
         vm.onQuit = {
             NSApp.terminate(nil)
         }
         vm.onShowProviderManager = { [weak self] in
-            self?.popover?.close()
+            self?.closePopoverNow()
             self?.showProviderManagerWindow()
         }
+        vm.onAddProvider = { [weak self] in
+            self?.closePopoverNow()
+            self?.showProviderManagerWindow(openAdd: true)
+        }
+        vm.onEditDirectLine = { [weak self] name in
+            self?.closePopoverNow()
+            self?.showProviderManagerWindow(openEdit: name)
+        }
         vm.onSpeedTest = { [weak self] in
-            self?.popover?.close()
+            self?.closePopoverNow()
             self?.showSpeedTestWindow()
         }
         vm.onManageProjects = { [weak self] in
-            self?.popover?.close()
+            self?.closePopoverNow()
             self?.showProjectManagerWindow()
         }
         vm.onShowErrorDiagnosis = { [weak self] in
-            self?.popover?.close()
+            self?.closePopoverNow()
             self?.showErrorDiagnosisWindow()
+        }
+        vm.onShowPromotionRadar = { [weak self] in
+            self?.closePopoverNow()
+            self?.showPromotionRadarWindow()
         }
 
         BalanceService.shared.onUpdate = { [weak self] name, info in
@@ -123,11 +146,30 @@ final class StatusController: NSObject {
         updateBadge()
         startBalanceAutoRefresh()
         lineCheckService.startAutoProbe(initialDelay: lineAutoProbeInitialDelay, interval: lineAutoProbeInterval)
+        lineCheckService.startRoutingLeakWatch(interval: 30 * 60)
+        // 优惠雷达：60 秒心跳，真正的到点判定在 PromotionSchedule.due（纯函数、已单测）。
+        // initialDelay 8 秒是让开机时的网关刷新、余额拉取先落地，别抢同一批 IO。
+        promotionService.start(initialDelay: 8)
+
+        installOutsideFallbackMonitors()
+        vm.onPickerChanged = { [weak self] in
+            // 选择事件在 NSMenu tracking loop 内触发；异步一拍等 tracking 收尾后复位 key——
+            // tracking 会让 popover 窗口失 key（click-through，第一下白点，#265 层3/D6 实测）。
+            DispatchQueue.main.async {
+                self?.popover?.contentViewController?.view.window?.makeKey()
+            }
+        }
     }
 
     func stop() {
+        // 常驻外点兜底监视器唯一卸载点（见 installOutsideFallbackMonitors）
+        if let g = outsideMonitorGlobal { NSEvent.removeMonitor(g) }
+        if let l = outsideMonitorLocal { NSEvent.removeMonitor(l) }
+        outsideMonitorGlobal = nil
+        outsideMonitorLocal = nil
         stopBalanceAutoRefresh()
         lineCheckService.stopAutoProbe()
+        promotionService.stop()
         sessionManager.stop()
         providerService.stop()
         projectManager.stop()
@@ -136,6 +178,61 @@ final class StatusController: NSObject {
             NSStatusBar.system.removeStatusItem(item)
         }
         statusItem = nil
+    }
+
+    /// 需要立刻让出焦点的动作（launch/切换/重命名/聚焦/开窗）前同步关弹窗。
+    /// animates=true 时 close() 是异步动画：动画期间 isShown 仍 true、系统 transient
+    /// 外点监视器未卸载，此时抢焦点会把 popover 打成半死态——外点关失效（持久）+
+    /// show 失效（isShown 卡 true 让 togglePopover 误落 close 分支，分钟级自愈）。
+    /// 详见 .local/notes-281/265-bug-popover-close-report.md（#265）。
+    private func closePopoverNow() {
+        guard let pop = popover else { return }   // 局部强引用：close 完成前对象必不被 ARC 释放
+        pop.animates = false   // 必须在 close() 前：动画开关在 close 调用瞬间被读取
+        pop.close()            // animates=false ⇒ 同步完成：isShown 立即 false，监视器正常卸载
+        popover = nil          // close 后才断引用：期间读到 self.popover 的代码看到的仍是已关实例
+    }
+
+    /// 常驻自管外点兜底（#265 第二脏源）：弹窗内 NSMenu tracking（Picker/Menu 的真实鼠标
+    /// 事件路径）会杀死系统 transient 外点监视器——实测恢复 key 后外点仍不关，监视器死
+    /// 独立于 key 态（fix-plan2.md §1 轮 G7）。系统监视器活着时本兜底零干扰：0.4s 延迟内
+    /// 系统已带动画关弹窗，isShown=false 兜底不触发；死了则兜底同步关。
+    /// start() 唯一安装点，幂等 guard 防重复；无常态卸载（仅 stop()）。
+    private func installOutsideFallbackMonitors() {
+        guard outsideMonitorGlobal == nil, outsideMonitorLocal == nil else { return }
+        outsideMonitorGlobal = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] event in
+            self?.handleOutsideClick(event, source: .otherApp)
+        }
+        outsideMonitorLocal = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] event in
+            self?.handleOutsideClick(event, source: .ownApp)
+            return event   // 只观察不吞事件：内部按钮/Picker 点击照常分发
+        }
+    }
+
+    private func handleOutsideClick(_ event: NSEvent, source: PopoverClickClassifier.Source) {
+        guard let pop = popover, pop.isShown else { return }   // 无弹窗不管
+        guard let win = pop.contentViewController?.view.window else { return }
+        // 外点 = 点击目标不属于弹窗自己的界面树（窗口父子链），不看矩形也不猜层级。
+        // 旧判据「落在弹窗矩形外 + 层级 != 101」把线路下拉（挂在弹窗下的独立子窗口、
+        // 层级 25、矩形在弹窗外）判成了外点：点一下线路，0.4s 后主弹窗被关（2026-10-10）。
+        // 判定规则与实测依据见 PopoverClickClassifier。
+        let ew = event.window
+        let outside = PopoverClickClassifier.isOutside(
+            source: source,
+            hasWindow: ew != nil,
+            inPopoverFamily: ew.map { PopoverClickClassifier.inFamily($0, of: win) { $0.parent } } ?? false,
+            windowLevel: ew?.level.rawValue ?? 0
+        )
+        guard outside else { return }
+        // 延迟兜底：给系统监视器 0.4s 先按原动画关；实例同一性 guard 防止用户
+        // 0.4s 内已重开新弹窗时被误关（连点多次外点亦幂等）。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self, self.popover === pop, pop.isShown else { return }
+            self.closePopoverNow()
+        }
     }
 
     @objc private func togglePopover() {
@@ -175,7 +272,7 @@ final class StatusController: NSObject {
 
     /// 线路设置独立窗口（B 路线④的弹窗形态）：复用单窗口，切线路只换内容。
     private func openProviderSettings(name: String) {
-        popover?.close()
+        closePopoverNow()
         let editor = ProviderEditorView(providerName: name, onSaved: { [weak self] in
             self?.lineCheckService.refresh()
             // 模型列表可能变了：同步 gw-*.json 的 gateway_models/model_notice
@@ -318,13 +415,16 @@ final class StatusController: NSObject {
 
     // MARK: - Provider Manager Window
 
-    private func showProviderManagerWindow() {
+    private func showProviderManagerWindow(openAdd: Bool = false, openEdit: String? = nil) {
         if let w = providerManagerWindow, w.isVisible {
             w.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
+            if openAdd { NotificationCenter.default.post(name: ProviderManagerView.openAddNotification, object: nil) }
+            if let openEdit { NotificationCenter.default.post(name: ProviderManagerView.openEditNotification, object: openEdit) }
             return
         }
-        let view = ProviderManagerView(gateway: gatewayService, lineCheck: lineCheckService, onChange: { [weak self] in
+        let view = ProviderManagerView(gateway: gatewayService, lineCheck: lineCheckService, openAddOnAppear: openAdd,
+                                       openEditOnAppear: openEdit, onChange: { [weak self] in
             self?.refreshVM()
         })
         let hosting = NSHostingController(rootView: view)
@@ -359,6 +459,25 @@ final class StatusController: NSObject {
         speedTestWindow = window
     }
 
+    private func showPromotionRadarWindow() {
+        if let w = promotionRadarWindow, w.isVisible {
+            w.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let view = PromotionRadarView()
+        let hosting = NSHostingController(rootView: view)
+        let window = NSWindow(contentViewController: hosting)
+        window.title = "优惠雷达"
+        window.styleMask = [.titled, .closable]
+        window.setContentSize(NSSize(width: 540, height: 600))
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        promotionRadarWindow = window
+    }
+
 
     private func showErrorDiagnosisWindow() {
         if let w = errorDiagnosisWindow, w.isVisible {
@@ -366,7 +485,21 @@ final class StatusController: NSObject {
             NSApp.activate(ignoringOtherApps: true)
             return
         }
-        let hosting = NSHostingController(rootView: ErrorDiagnosisView())
+
+        // 弹窗「线路状态」里挂 ⚠️ 的都收进来：网关线路的测通失败（不以 ✅ 开头）+ 直连线路的状态异常。
+        // 原来只收测通失败，直连线路的 ⚠️ 在这里看不到（2026-10-09 线路状态审查）
+        var problems: [(name: String, error: String)] = lineCheckService.probeResults
+            .filter { !$0.value.text.isEmpty && !$0.value.text.hasPrefix("✅") }
+            .map { (gatewayProviderGroupDisplayName($0.key), $0.value.displayText) }
+        for id in vm.directLines {
+            guard let health = HealthService.shared.cached(id),
+                  health.status == .down || health.status == .exhausted else { continue }
+            // 会被「填入诊断」发给诊断模型，过一遍脱敏（测通结果在 LineCheckService 里已经过了）
+            problems.append(("\(providerDisplayName(id))（直连）",
+                             "\(gatewayVisibleText(health.detail ?? "线路不可用"))（\(AgeText.ago(health.checkedAt))检查）"))
+        }
+
+        let hosting = NSHostingController(rootView: ErrorDiagnosisView(autoDetectedErrors: problems))
         let window = NSWindow(contentViewController: hosting)
         window.title = "错误诊断"
         window.styleMask = [.titled, .closable, .resizable]
@@ -381,13 +514,17 @@ final class StatusController: NSObject {
 
     // MARK: - Launch
 
-    private func doLaunch(provider: String, project: String, terminalName: String) {
+    private func doLaunch(provider: String, project: String, terminalName: String,
+                          model: String? = nil, effort: String? = nil) {
         let registry = TerminalRegistry.shared
         let adapter = registry.adapters.first { $0.name == terminalName }
             ?? registry.defaultAdapter
 
         let ccgoPath = locateCCGo()
-        let command = "\(shellQuote(ccgoPath)) \(shellQuote(provider)) \(shellQuote(project))"
+        // 启动表单选的模型 / 思考强度只带进这一次的命令（LaunchOptions）
+        let command = LaunchOptions.ccgoArguments(ccgo: ccgoPath, provider: provider, project: project,
+                                                  model: model, effort: effort)
+            .map { shellQuote($0) }.joined(separator: " ")
         let projectName = (project as NSString).lastPathComponent
         let num = sessionManager.nextSessionNumber()
         let title = "#\(num) \(providerDisplayName(provider)) · \(projectName)"
@@ -403,6 +540,9 @@ final class StatusController: NSObject {
 
     // MARK: - Switch
 
+    /// 正在切线的登记号（只在主线程读写）。切线第一步就不可逆，同一会话不许并发发起两次。
+    private var switchesInFlight = Set<Int>()
+
     private func doSwitch(session: SessionInfo, target: String) {
         // 收编会话（直接启动）没有 ccgo 的 pending 重启机制，就地切换会杀掉会话且无法恢复——
         // 统一路由到"新窗口继承"（resume 同一会话 + 新线路）。
@@ -410,8 +550,12 @@ final class StatusController: NSObject {
             doRecoverInNewWindow(session: session, target: target)
             return
         }
+        let num = session.sessionNumber
+        guard !switchesInFlight.contains(num) else { return }
+        switchesInFlight.insert(num)
         DispatchQueue.global().async { [weak self] in
             guard let self else { return }
+            defer { DispatchQueue.main.async { self.switchesInFlight.remove(num) } }
             let claudeDir = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".claude")
             // 按**登记号**命名，不按 pid：pid 是系统临时号会被复用，残留的 pending 文件
@@ -452,10 +596,60 @@ final class StatusController: NSObject {
                 return
             }
 
-            let claudePID = self.findClaudePID(onTTY: session.tty)
-            if let claudePID = claudePID {
-                kill(pid_t(claudePID), SIGTERM)
+            let recovery: String
+            if let dir = payload["handoffDir"] {
+                recovery = "ccgo \(self.shellQuote(target)) \(self.shellQuote(session.project)) --handoff \(self.shellQuote(dir))"
+            } else {
+                recovery = "ccgo \(self.shellQuote(target)) \(self.shellQuote(session.project)) --resume \(self.shellQuote(sessionID))"
             }
+            guard let claudePID = self.findClaudePID(onTTY: session.tty) else {
+                // 以前这里静默跳过：请求文件留在盘上，会话哪天退出就哪天被莫名换线
+                try? FileManager.default.removeItem(at: pendingFile)
+                self.reportSwitchFailure(num: num, reason: "在该终端里找不到 claude 进程，本次切换已取消。", recovery: nil)
+                return
+            }
+            kill(pid_t(claudePID), SIGTERM)
+            self.verifySwitch(session: session, oldClaudePID: claudePID, pendingFile: pendingFile, recovery: recovery)
+        }
+    }
+
+    /// 发起者自己确认结果：请求被消费 + 该终端里跑着一个**新的** claude 才算成功。
+    /// 重启沿用包装脚本的 pid（exec），登记表行不变，所以判据看的是终端里的 claude 换没换人。
+    /// 在后台线程阻塞轮询（调用方已在 global 队列），超时即报错并收走请求文件。
+    private func verifySwitch(session: SessionInfo, oldClaudePID: Int, pendingFile: URL, recovery: String) {
+        let deadline = Date().addingTimeInterval(25)
+        var outcome = SwitchOutcome.pending
+        while outcome == .pending {
+            Thread.sleep(forTimeInterval: 0.5)
+            let current = findClaudePID(onTTY: session.tty)
+            outcome = SwitchOutcome.judge(
+                requestFileExists: FileManager.default.fileExists(atPath: pendingFile.path),
+                oldClaudeAlive: kill(pid_t(oldClaudePID), 0) == 0,
+                newClaudeOnTTY: current != nil && current != oldClaudePID,
+                timedOut: Date() >= deadline
+            )
+        }
+        DispatchQueue.main.async { self.sessionManager.refreshNow() }
+        guard let reason = outcome.failureText else { return }
+        // 失败就收走请求：留着它，这个号的会话日后退出时会被莫名其妙地换线
+        try? FileManager.default.removeItem(at: pendingFile)
+        reportSwitchFailure(num: session.sessionNumber, reason: reason, recovery: recovery)
+    }
+
+    private func reportSwitchFailure(num: Int, reason: String, recovery: String?) {
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = "#\(num) 切换线路没有成功"
+            var text = reason
+            if let recovery {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(recovery, forType: .string)
+                text += "\n\n会话内容没有丢。在任意终端粘贴下面这行即可接回（已复制到剪贴板）：\n\n\(recovery)"
+            }
+            alert.informativeText = text
+            alert.alertStyle = .warning
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
         }
     }
 
@@ -637,6 +831,48 @@ final class StatusController: NSObject {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         return String(data: data, encoding: .utf8)
+    }
+
+    // MARK: - Focus
+
+    /// 把会话所在的终端分屏/窗口切到前台。
+    /// 登记行知道自己在哪个终端（ccgo 按 TERM_PROGRAM 写的 iterm2/ghostty/terminal），先问它；
+    /// 收编行/直接启动行的 terminal 字段是 "adopted"/"—"，不知道在哪，就把其余**在运行的**终端轮一遍
+    /// （没在跑的不问：`tell application` 会把它拉起来）。tty 在每个终端里都唯一，先命中先停。
+    private func doFocus(session: SessionInfo) {
+        guard session.hasTerminal else {
+            showError(TerminalAdapterError.scriptFailed(
+                "这个进程没有终端（tty \(session.tty)），没有窗口可以切过去。"))
+            return
+        }
+        let hint = SessionFocusHint(title: SessionInfo.hookTitle(tty: session.tty),
+                                    projectPath: session.project)
+        let registry = TerminalRegistry.shared
+        let preferred = registry.adapters.filter { $0.identifier == session.terminal }
+        let others = registry.adapters.filter { $0.identifier != session.terminal }
+        // runningApplications 在主线程读，再把名单带到后台去跑脚本
+        let candidates = (preferred + others).filter { $0.isRunning }
+        let label = session.num != nil ? "#\(session.sessionNumber)" : "pid \(session.pid)"
+        guard !candidates.isEmpty else {
+            showError(TerminalAdapterError.scriptFailed(
+                "iTerm2、Ghostty、Terminal 都没在运行，找不到 \(label) 的窗口。"))
+            return
+        }
+        DispatchQueue.global().async { [weak self] in
+            var failures: [String] = []
+            for adapter in candidates {
+                do {
+                    if try adapter.focusSession(tty: session.tty, hint: hint) { return }
+                } catch {
+                    failures.append("\(adapter.name)：\(error)")
+                }
+            }
+            let searched = candidates.map { $0.name }.joined(separator: "、")
+            var message = "在 \(searched) 里没找到 \(label) 的分屏（\(session.tty)）。\n"
+                + "窗口可能已经关掉了；如果它在 Ghostty 里，分屏标题得先由 session-hud hook 写过一次才认得出来。"
+            if !failures.isEmpty { message += "\n\n脚本报错：\n" + failures.joined(separator: "\n") }
+            DispatchQueue.main.async { self?.showError(TerminalAdapterError.scriptFailed(message)) }
+        }
     }
 
     // MARK: - Rename

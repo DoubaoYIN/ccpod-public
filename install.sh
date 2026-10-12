@@ -113,6 +113,29 @@ else
   warn "缺少 $REPO_DIR/scripts/claude-rename — 菜单栏的重命名按钮会报找不到工具"
 fi
 
+# ─── 4d. 优惠雷达抓取器（源在本仓，是产品依赖）───
+# 菜单栏「优惠雷达」每天 21:00 调 ~/.claude/bin/promo-fetch.py，规则在同目录 promo-rules.json。
+# 与 claude-rename 同一套「仓库存源码、装运行时副本」模式：这里无条件覆盖。
+# 规则单独成文件是为了改规则不用重编译 App（新厂商的定价页写法随时会变）。
+# cchandoff.py 必须一起装：promo-fetch.py 靠它的 redact() 做错误脱敏（T4-R2，错误页不豁免）。
+#   脚本装到 ~/.claude/bin 后 sys.path[0] 就是那个目录，`from scripts.cchandoff` 解析不到，
+#   只剩 `from cchandoff import redact` 这条 fallback——漏装 = ImportError，抓取器直接崩溃。
+for promo in promo-fetch.py cchandoff.py promo-rules.json; do
+  if [[ -f "$REPO_DIR/scripts/$promo" ]]; then
+    mkdir -p "$CLAUDE_DIR/bin"
+    cp "$REPO_DIR/scripts/$promo" "$CLAUDE_DIR/bin/$promo"
+    # 一次 chmod 定死权限位，不要「先 +x 再 644」——那样两次安装之间会漂成 744。
+    # 脚本经 /usr/bin/env python3 调，+x 不是必需，但用户直接敲它时也该能跑。
+    # 这几个文件里没有秘密（情报落盘的 ccpod-promotions*.json 才要 600，
+    # 那由 PromotionStore.write 显式设），所以不用收紧到 600。
+    if [[ "$promo" == *.py ]]; then chmod 755 "$CLAUDE_DIR/bin/$promo"
+    else chmod 644 "$CLAUDE_DIR/bin/$promo"; fi
+    info "复制: $promo → ~/.claude/bin/"
+  else
+    warn "缺少 $REPO_DIR/scripts/$promo — 优惠雷达运行时副本缺件，面板可能不可用"
+  fi
+done
+
 # ─── 5. Approval Gate（2026-09-26 已下线）──────────────────
 # 下线原因（用户拍板）：Claude Code 自带的权限体系已经够用，不需要我们再插一层；
 # 而且这一层会把每次工具调用的命令、路径、参数摘要发给第三方模型判断，容易侵犯用户隐私。

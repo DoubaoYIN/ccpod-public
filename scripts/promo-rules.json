@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "official_domains": ["help.aliyun.com"],
+  "family_labels": {
+    "deepseek": "DeepSeek",
+    "kimi": "Kimi",
+    "qwen": "Qwen",
+    "glm": "GLM"
+  },
+  "rules": [
+    {
+      "id": "bailian-peakvalley",
+      "vendor": "阿里云百炼",
+      "class": "peak_valley",
+      "url_domain_contains": "help.aliyun.com",
+      "url_path_contains": "billing-for-model-studio",
+      "eligibility": "无需报名，闲时时段调用自动按闲时价计费；具体单价与地域以官方页为准",
+      "window": {
+        "pattern": "忙时为北京时间\\s*(?P<peak_start>\\d{1,2}:\\d{2})\\s*-\\s*(?P<peak_end>\\d{1,2}:\\d{2})\\s*，闲时为北京时间\\s*(?P<off_start>\\d{1,2}:\\d{2})\\s*-\\s*次日\\s*(?P<off_end>\\d{1,2}:\\d{2})",
+        "tz": "Asia/Shanghai",
+        "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+        "ends_next_day": true
+      },
+      "valid_from": {
+        "pattern": "已于\\s*(?P<valid_from>\\d{4}-\\d{2}-\\d{2})\\s*00:00\\s*起调整为峰谷定价模式"
+      },
+      "items": {
+        "pattern": "(?P<model>[a-z0-9][a-z0-9.\\-]*)\\s+上下文缓存\\s+享有折扣\\s+(?:(?P<scope>全球|国际|美国|中国内地)\\s+)?忙时\\s*(?P<peak_in>[\\d.]+)\\s*元\\s*闲时\\s*(?P<off_in>[\\d.]+)\\s*元\\s+忙时\\s*(?P<peak_out>[\\d.]+)\\s*元\\s*闲时\\s*(?P<off_out>[\\d.]+)\\s*元"
+      },
+      "evidence": [
+        "忙时为北京时间[^。]*。",
+        "已于[^。]*峰谷定价模式[^。]*。"
+      ]
+    }
+  ]
+}

@@ -33,6 +33,34 @@ enum LineAutoProbePolicy {
         current == .unsure ? previous : current
     }
 
+    /// 周期实测对行内已有测通结论的处理（新结论盖旧结论，2026-10-09 线路状态审查）：
+    /// - 本轮开始后用户手动测出的结论更新，不碰；
+    /// - 由通转断：挂上失败（收起时的 ⚠️ 就是它）；
+    /// - 已有结论的刷新成本轮结果：通了旧失败作废（原来只撤自动挂的，手动测出的旧失败会一直挂着 ⚠️），
+    ///   还没通就更新时间（否则「多久以前测」停在第一次失败）；拿不准的不盖确定结论；
+    /// - 没有结论的不新挂：从没通过的线路（只认 Claude Code 客户端的中转站，探测必 403）不制造 ⚠️。
+    enum ResultUpdate: Equatable { case keep, showFailure, showPass }
+
+    static func resultUpdate(alert: Bool, current: LineProbeVerdict, hasExisting: Bool, existingIsNewer: Bool) -> ResultUpdate {
+        if existingIsNewer { return .keep }
+        if alert { return .showFailure }
+        guard hasExisting else { return .keep }
+        switch current {
+        case .pass: return .showPass
+        case .hardFail: return .showFailure
+        case .unsure: return .keep
+        }
+    }
+
+    /// 一轮实测的一行总结。原来只有「5/7 通」，没通的是哪几条要逐行点开猜（2026-10-09 线路状态审查）。
+    /// failed / unsure = 确定失败 / 结果不确定的线路显示名，按实测顺序。
+    static func summary(passed: Int, total: Int, failed: [String], unsure: [String]) -> String {
+        var parts = ["自动实测 \(passed)/\(total) 通"]
+        if !failed.isEmpty { parts.append("没通：" + failed.joined(separator: "、")) }
+        if !unsure.isEmpty { parts.append("结果不确定：" + unsure.joined(separator: "、")) }
+        return parts.joined(separator: "，")
+    }
+
     /// 一轮合并成一条通知。上次通过的线路「全部」同时断（≥2 条）= 多半是网关或入站 key，不是各家上游。
     static func alert(newlyFailed: [String], previouslyPassing: Int) -> (title: String, body: String)? {
         guard !newlyFailed.isEmpty else { return nil }

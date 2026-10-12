@@ -54,6 +54,30 @@ import Foundation
         let some = P.alert(newlyFailed: ["智谱", "Kimi"], previouslyPassing: 4)
         expect(some?.body.contains("网关") == false && some?.title.contains("Kimi") == true, "部分断仍按线路报", "实际：\(String(describing: some))")
 
+        // 行内结论：新结论盖旧结论（2026-10-09）
+        func upd(_ alert: Bool, _ v: LineProbeVerdict, has: Bool, newer: Bool = false) -> P.ResultUpdate {
+            P.resultUpdate(alert: alert, current: v, hasExisting: has, existingIsNewer: newer)
+        }
+        expect(upd(true, .hardFail, has: false) == .showFailure, "由通转断挂失败", "原有行为：提醒的同时行内挂红字")
+        expect(upd(true, .hardFail, has: true) == .showFailure, "由通转断盖旧结论", "")
+        expect(upd(true, .hardFail, has: true, newer: true) == .keep, "本轮中手动测的更新不碰", "手动结论比这一轮新")
+        expect(upd(false, .pass, has: true) == .showPass, "测通了旧失败作废", "原来手动测出的旧失败会一直挂 ⚠️")
+        expect(upd(false, .pass, has: false) == .keep, "测通且没结论不新挂", "")
+        expect(upd(false, .hardFail, has: false) == .keep, "从没通过的不制造⚠️", "aigocode/yescode 探测必 403")
+        expect(upd(false, .hardFail, has: true) == .showFailure, "还没通刷新时间", "否则「多久以前测」停在第一次失败")
+        expect(upd(false, .unsure, has: true) == .keep, "拿不准不盖确定结论", "")
+        expect(upd(false, .pass, has: true, newer: true) == .keep, "手动更新的结论优先", "")
+
+        // 一轮总结：没通的要点名（2026-10-09 线路状态审查：原来只有「5/7 通」）
+        let allPass = P.summary(passed: 7, total: 7, failed: [], unsure: [])
+        expect(allPass == "自动实测 7/7 通", "全通不加尾巴", "实际：\(allPass)")
+        let named = P.summary(passed: 5, total: 7, failed: ["AIGoCode", "Yescode"], unsure: [])
+        expect(named == "自动实测 5/7 通，没通：AIGoCode、Yescode", "确定失败点名", "实际：\(named)")
+        let mixed = P.summary(passed: 4, total: 7, failed: ["AIGoCode", "Yescode"], unsure: ["智谱"])
+        expect(mixed == "自动实测 4/7 通，没通：AIGoCode、Yescode，结果不确定：智谱", "拿不准单独列", "实际：\(mixed)")
+        let onlyUnsure = P.summary(passed: 6, total: 7, failed: [], unsure: ["Kimi"])
+        expect(onlyUnsure == "自动实测 6/7 通，结果不确定：Kimi", "只有拿不准", "实际：\(onlyUnsure)")
+
         if failures.isEmpty {
             print("PASS line_auto_probe")
         } else {

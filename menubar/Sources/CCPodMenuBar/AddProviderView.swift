@@ -4,8 +4,14 @@ struct AddProviderView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var selectedTemplate: ProviderTemplate?
     @State private var selectedPlanIndex = 0
+    /// 🔑 说明是否展开（默认收起；换厂商、换计费模式都重新收起）
+    @State private var keyNoteExpanded = false
     @State private var fieldValues: [String: String] = [:]
     @State private var customName: String = ""
+    /// 用户手改过名称后，切换计费模式不再覆盖它
+    @State private var nameEdited = false
+    /// 已有 key 的指纹（后台加载），用于提示"同一把 key / 同厂商另一把 key"（多账号预案）
+    @State private var existingKeys: [KeyFingerprint.Entry] = []
     @State private var errorMessage: String?
     @State private var isSaving = false
     @State private var savingStage: String?
@@ -27,8 +33,15 @@ struct AddProviderView: View {
                 templateList
             }
         }
-        .frame(width: 340, height: 380)
+        .frame(width: 340, height: 440)
         .interactiveDismissDisabled(isSaving)
+        .onAppear {
+            let dir = providersDir
+            DispatchQueue.global(qos: .utility).async {
+                let entries = KeyFingerprint.loadAll(providersDir: dir)
+                DispatchQueue.main.async { existingKeys = entries }
+            }
+        }
     }
 
     private var header: some View {
@@ -66,8 +79,10 @@ struct AddProviderView: View {
                         ForEach(items, id: \.id) { tpl in
                             Button(action: {
                                 selectedTemplate = tpl
-                                customName = tpl.id == "relay" ? "" : tpl.id
                                 selectedPlanIndex = 0
+                                keyNoteExpanded = false
+                                nameEdited = false
+                                customName = tpl.id == "relay" ? "" : suggestedID(tpl, planIndex: 0)
                                 fieldValues = tpl.plans.first?.defaultModel.map { ["model": $0] } ?? [:]
                                 errorMessage = nil
                             }) {
@@ -101,9 +116,14 @@ struct AddProviderView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
                         Text("名称").frame(width: 50, alignment: .trailing).font(.system(size: 12))
-                        TextField("provider 名称", text: $customName)
+                        TextField("管线名称（可中文）", text: nameBinding)
                             .textFieldStyle(.roundedBorder)
                             .font(.system(size: 12))
+                    }
+                    if let id = autoIDPreview(tpl) {
+                        Text("中文等名称作显示名，内部 ID 自动用「\(id)」")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
                     }
                     if tpl.plans.count > 1 {
                         // 同一厂商的订阅 Plan 和按量付费是两套端点+两套 key，互不通用
@@ -131,9 +151,11 @@ struct AddProviderView: View {
                         }
                         .pickerStyle(.radioGroup)
                         .onChange(of: selectedPlanIndex) { _ in
-                            if let model = tpl.plans[selectedPlanIndex].defaultModel {
-                                fieldValues["model"] = model
-                            }
+                            // 没有默认模型的模式要清空：否则沿用上一个模式的模型名（如 Coding Plan 的
+                            // doubao-seed-evolving 带进按量）→ 实测报"账号未开通该模型"，用户看不懂（2026-10-08）
+                            fieldValues["model"] = tpl.plans[selectedPlanIndex].defaultModel ?? ""
+                            if !nameEdited { customName = suggestedID(tpl, planIndex: selectedPlanIndex) }
+                            keyNoteExpanded = false
                         }
                     } else if let only = tpl.plans.first {
                         HStack {
@@ -161,21 +183,49 @@ struct AddProviderView: View {
                             .textFieldStyle(.roundedBorder)
                             .font(.system(size: 12))
                     }
-                    if let keyNote = currentPlan(tpl)?.keyNote, !keyNote.isEmpty {
-                        Text("🔑 \(keyNote)")
+                    if let notice = KeyFingerprint.notice(newKey: fieldValues["api_key"] ?? "",
+                                                          baseURL: effectiveBaseURL(tpl), existing: existingKeys) {
+                        Text(notice)
                             .font(.system(size: 10))
-                            .foregroundColor(.secondary)
+                            .foregroundColor(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let plan = currentPlan(tpl), !plan.keyNote.isEmpty {
+                        // 默认只露第一句（填什么 key），其余点「详细说明」才展开：用户嫌表单下方小字太多、看不懂（2026-10-09）
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("🔑 \(plan.keyNoteLead)")
+                            if !plan.keyNoteRest.isEmpty {
+                                if keyNoteExpanded {
+                                    Text(plan.keyNoteRest)
+                                }
+                                Button(keyNoteExpanded ? "收起说明" : "详细说明…") { keyNoteExpanded.toggle() }
+                                    .buttonStyle(.plain)
+                                    .foregroundColor(.accentColor)
+                            }
+                        }
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .id(selectedPlanIndex)  // 强制重建：切计费模式时显示对应的 keyNote
                     }
                     Text("保存前会用真实请求实测一次：地址、key、模型名任一不对都会被拦下，不会存进一条用不了的线路")
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
-                    if let err = errorMessage {
-                        Text(err).font(.system(size: 11)).foregroundColor(.red)
-                    }
                 }
                 .padding(12)
             }
-            Spacer()
+            // 报错放在滚动区外、按钮正上方：以前塞在表单末尾，长报错被挤出视野看不全（2026-10-08）
+            if let err = errorMessage {
+                ScrollView {
+                    Text(err)
+                        .font(.system(size: 11))
+                        .foregroundColor(.red)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 110)
+                .padding(.horizontal, 12)
+            }
             HStack {
                 Spacer()
                 Button(savingStage ?? "添加") { save(tpl) }
@@ -186,6 +236,47 @@ struct AddProviderView: View {
             }
             .padding(.bottom, 12)
         }
+    }
+
+    private func effectiveBaseURL(_ tpl: ProviderTemplate) -> String {
+        let relayURL = fieldValues["base_url"] ?? ""
+        return relayURL.isEmpty ? (currentPlan(tpl)?.baseURL ?? "") : relayURL
+    }
+
+    private var nameBinding: Binding<String> {
+        Binding(
+            get: { customName },
+            set: { customName = $0; nameEdited = true }
+        )
+    }
+
+    /// 默认名 = 厂商-计费模式（如 volcengine-payg），一眼区分同厂商的订阅/按量；单模式厂商只用厂商 id。
+    /// 重名自动加 -2、-3。
+    private func suggestedID(_ tpl: ProviderTemplate, planIndex: Int) -> String {
+        let base: String
+        if tpl.plans.count > 1, tpl.plans.indices.contains(planIndex) {
+            base = "\(tpl.id)-\(tpl.plans[planIndex].id)"
+        } else {
+            base = tpl.id
+        }
+        return uniqueID(base)
+    }
+
+    private func uniqueID(_ base: String) -> String {
+        func exists(_ id: String) -> Bool {
+            FileManager.default.fileExists(atPath: providersDir.appendingPathComponent(id).appendingPathExtension("json").path)
+        }
+        guard exists(base) else { return base }
+        var n = 2
+        while exists("\(base)-\(n)") { n += 1 }
+        return "\(base)-\(n)"
+    }
+
+    /// 名称不能直接当 ID（含中文、空格等）时，内部 ID 用的自动值；能直接当 ID 时返回 nil
+    private func autoIDPreview(_ tpl: ProviderTemplate) -> String? {
+        let name = customName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !isValidProviderID(name) else { return nil }
+        return suggestedID(tpl, planIndex: selectedPlanIndex)
     }
 
     private func binding(for key: String) -> Binding<String> {
@@ -221,11 +312,16 @@ struct AddProviderView: View {
     }
 
     private func save(_ tpl: ProviderTemplate) {
-        let name = customName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { return }
-        guard isValidProviderID(name) else {
-            errorMessage = "名称只能包含字母、数字、点、下划线、短横线"
-            return
+        let typed = customName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !typed.isEmpty else { return }
+        // 名称是 ID（文件名/钥匙串服务名/命令行参数）就只能是 ASCII；中文等名称存为 display_name，ID 自动生成
+        let name: String
+        var displayName: String?
+        if isValidProviderID(typed) {
+            name = typed
+        } else {
+            name = suggestedID(tpl, planIndex: selectedPlanIndex)
+            displayName = typed
         }
 
         let filePath = providersDir.appendingPathComponent(name).appendingPathExtension("json")
@@ -265,6 +361,7 @@ struct AddProviderView: View {
             json["env"] = env
             json["claude_args"] = ["--model", model]
             json["source"] = "manual"
+            if let displayName { json["display_name"] = displayName }
             if let planID = plan?.id { json["billing_plan"] = planID }
             if let actual = outcome.actualModel, actual != model {
                 json["preflight_actual_model"] = actual

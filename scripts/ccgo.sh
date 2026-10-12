@@ -26,6 +26,8 @@ USAGE
   ccgo <provider> <project>    在最近使用过、路径含 <project> 的目录启动
   ccgo <provider> <project> --resume <session-id>
   ccgo <provider> <project> --handoff <handoff-dir>
+  ccgo <provider> [<project>] --model <模型> --effort <档位>
+                               只这一次：换成管线清单里的别的模型 / 思考强度（low…max），不改线路文件
   ccgo --help, -h              显示帮助
 
 每个窗口独立：env 注入，不改 settings.json。
@@ -36,6 +38,7 @@ EXAMPLES
   ccgo easy analytics          easyclaude + 最近含 "analytics" 的项目
   ccgo off ccpod               official + 最近含 "ccpod" 的项目
   ccgo my-relay /Users/yourname --resume aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+  ccgo off ccpod --effort max  official + ccpod，这一次用最高思考强度
 EOF
 }
 
@@ -46,23 +49,44 @@ main() {
 
   require_cmd claude "https://github.com/anthropics/claude-code"
 
-  local name workdir resume_id handoff_dir
+  local name workdir resume_id handoff_dir project_arg model_override effort_override has_project=""
   name="$(resolve_provider "$1")"
-
-  if [[ $# -ge 4 && "${3:-}" == "--resume" ]]; then
-    resume_id="$4"
-  elif [[ $# -ge 4 && "${3:-}" == "--handoff" ]]; then
-    handoff_dir="$4"
-  elif [[ $# -gt 2 ]]; then
-    die "参数无效；恢复会话请使用: ccgo <provider> <project> --resume <session-id> 或 --handoff <handoff-dir>"
+  shift
+  # 第二个参数是项目（可省略）；之后全是选项，顺序任意。
+  # 用 has_project 而不是「project_arg 非空」判断：菜单栏项目列表为空时会传空串，那种情况要照旧走项目查找
+  if [[ $# -gt 0 && "$1" != --* ]]; then
+    project_arg="$1"
+    has_project=1
+    shift
   fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --resume|--handoff|--model|--effort)
+        [[ $# -ge 2 && -n "${2:-}" ]] || die "参数 ${1} 缺值（用法见 ccgo --help）"
+        case "$1" in
+          --resume) resume_id="$2" ;;
+          --handoff) handoff_dir="$2" ;;
+          --model) model_override="$2" ;;
+          --effort) effort_override="$2" ;;
+        esac
+        shift 2
+        ;;
+      *) die "参数无效: ${1}（用法见 ccgo --help）" ;;
+    esac
+  done
+  if [[ -n "${resume_id:-}" && -n "${handoff_dir:-}" ]]; then
+    die "--resume 和 --handoff 不能同时用"
+  fi
+  # 启动时一次性的模型 / 思考强度：先校验，再做任何副作用（记项目偏好、同步配置目录）
+  check_launch_overrides "$name" "${model_override:-}" "${effort_override:-}" \
+    || die "启动参数无效（原因见上一行），没有启动"
 
-  if [[ $# -ge 2 ]]; then
-    if [[ -d "$2" ]]; then
-      workdir="$2"
+  if [[ -n "$has_project" ]]; then
+    if [[ -d "$project_arg" ]]; then
+      workdir="$project_arg"
     else
-      workdir="$(find_project_by_fragment "$2")" \
-        || die "找不到项目含 '$2'"
+      workdir="$(find_project_by_fragment "$project_arg")" \
+        || die "找不到项目含 '$project_arg'"
     fi
   else
     workdir="$(pwd)"
@@ -78,14 +102,14 @@ main() {
   # 无 key 状态启动并回落到 settings.json 的 apiKeyHelper，正是 common.sh 注释里声称要防的
   # 静默降级。改成赋值式捕获，失败即 die（赋值形式的命令替换失败会正常传播退出码）。
   local ccpod_env_out
-  ccpod_env_out="$(get_provider_env "$name")" \
+  ccpod_env_out="$(get_provider_env "$name" "${model_override:-}")" \
     || die "取线路 env 失败: ${name}（钥匙串不可用或 provider 配置有误）——拒绝以无 key 状态启动"
   eval "$ccpod_env_out"
   prepare_provider_claude_config "$name"
   local -a claude_args=()
   local ccpod_args_out
   # 同上：进程替换 < <(...) 失败时静默丢掉 --model 等参数，会话会以错误的模型启动
-  ccpod_args_out="$(get_provider_claude_args "$name")" \
+  ccpod_args_out="$(get_provider_claude_args "$name" "${model_override:-}" "${effort_override:-}")" \
     || die "取线路 claude 参数失败: $name"
   while IFS= read -r arg; do
     [[ -n "$arg" ]] && claude_args+=("$arg")

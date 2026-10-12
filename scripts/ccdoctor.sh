@@ -309,7 +309,7 @@ echo
 echo "网关路由"
 usage_db="$HOME/.claude-code-router/app-data/usage.sqlite"
 if [[ ! -f "$usage_db" ]] || ! command -v sqlite3 >/dev/null 2>&1; then
-  warn "读不到 CCR 账本，跳过（$usage_db）"
+  warn "读不到 CCR 账本，跳过（${usage_db}）"
 else
   since="$(date -u -v-24H +%Y-%m-%dT%H:%M:%S)"
   swapped="$(sqlite3 -readonly "$usage_db" "select model || ' → ' || logical_model || '  ×' || count(*) || '  最近 ' || max(created_at)
@@ -321,10 +321,68 @@ else
   elif [[ -n "$swapped" ]]; then
     warn "近 24 小时有请求被网关换成了别的模型（请求的 → 实际用的）："
     sed 's/^/     /' <<<"$swapped"
+    echo "     请求写着 Opus/Fable 却落到 GLM 的多半是子代理：CCR 对子代理请求不看客户端指定的模型（PITFALLS #57）。"
+    echo "     10-09 起新开的会话由 ccgo 把子代理档写成全局默认模型（请求本身就写 GLM，不算换模）；修复前启动的会话重开即可。"
   else
     ok "近 24 小时没有请求被网关静默换模型"
   fi
 fi
+# 子代理档由 ccgo 按会话注入进程 env；settings.json 的 env 会无条件盖掉进程 env 并热加载进运行中的会话
+# （PITFALLS #24b/#56），所以主 settings 与各线路 settings 的 env 里都不能出现它（CCR 接管/profile env 可能写进来）。
+ccpod_claude_dir="${CCPOD_CLAUDE_DIR:-$HOME/.claude}"
+subagent_env_hits=""
+for f in "$ccpod_claude_dir/settings.json" "$ccpod_claude_dir"/provider-configs/*/settings.json; do
+  [[ -f "$f" ]] || continue
+  if python3 -c 'import json,sys; sys.exit(0 if "CLAUDE_CODE_SUBAGENT_MODEL" in ((json.load(open(sys.argv[1])) or {}).get("env") or {}) else 1)' "$f" 2>/dev/null; then
+    subagent_env_hits+="${f}"$'\n'
+  fi
+done
+if [[ -n "$subagent_env_hits" ]]; then
+  warn "settings 的 env 里有 CLAUDE_CODE_SUBAGENT_MODEL：会盖掉所有管线的子代理档并热加载进运行中的会话，请从这里删掉（子代理档由 ccgo 按会话注入）："
+  sed '/^$/d; s/^/     /' <<<"$subagent_env_hits"
+else
+  ok "没有 settings 把子代理档写进 env（子代理档只由 ccgo 按会话注入）"
+fi
+
+# ─── 自动压缩窗口安全网 ──────────────────────────────────────
+# 2026-10-09（PITFALLS #58）：Claude Code 2.1.289 把 opus/fable 当 1M 窗口，压缩点从 16.8 万悄悄挪到 97 万，
+# 会话涨到 40 万后缓存一冷首字节超过中转站 Cloudflare 的 100 秒就 524、原样重试 10 次。ccgo 按会话注入
+# CLAUDE_CODE_AUTO_COMPACT_WINDOW（默认 30 万，线路可改/关）。这里查三件事：
+#  ① 任何 settings 的 env 里不能有它（会盖掉所有线路并热加载进运行中会话，#24b/#56）；
+#  ② 运行中的 claude 进程 env 里有没有（修复前启动的没有，重开才生效）；
+#  ③ 正面证据只能手动取：`claude -p --model <线路/模型> "/context"` 看 `Tokens: x / 300k` 而不是 `/ 1m`（会花一次小请求）。
+echo
+echo "压缩窗口"
+compact_env_hits=""
+for f in "$ccpod_claude_dir/settings.json" "$ccpod_claude_dir"/provider-configs/*/settings.json; do
+  [[ -f "$f" ]] || continue
+  if python3 -c 'import json,sys; sys.exit(0 if "CLAUDE_CODE_AUTO_COMPACT_WINDOW" in ((json.load(open(sys.argv[1])) or {}).get("env") or {}) else 1)' "$f" 2>/dev/null; then
+    compact_env_hits+="${f}"$'\n'
+  fi
+done
+if [[ -n "$compact_env_hits" ]]; then
+  warn "settings 的 env 里有 CLAUDE_CODE_AUTO_COMPACT_WINDOW：会盖掉所有线路并热加载进运行中的会话，请从这里删掉（由 ccgo 按会话注入）："
+  sed '/^$/d; s/^/     /' <<<"$compact_env_hits"
+else
+  ok "没有 settings 把压缩窗口写进 env（只由 ccgo 按会话注入）"
+fi
+compact_with=0; compact_without=""
+while read -r pid; do
+  [[ -n "$pid" ]] || continue
+  if ps -E -p "$pid" -o command= 2>/dev/null | grep -q 'CLAUDE_CODE_AUTO_COMPACT_WINDOW='; then
+    compact_with=$((compact_with + 1))
+  else
+    compact_without+="$pid "
+  fi
+done < <(ps -axo pid=,command= | awk '$2=="claude"{print $1}')
+if [[ -n "$compact_without" ]]; then
+  warn "运行中的 claude 会话有 $(wc -w <<<"$compact_without" | tr -d ' ') 个没有压缩窗口安全网（安全网上线前启动的，pid: ${compact_without% }）：它们要到约 97 万 token 才会自动压缩，会话菜单「重启」即可带上；已带上的 ${compact_with} 个"
+elif (( compact_with > 0 )); then
+  ok "运行中的 ${compact_with} 个 claude 会话都带压缩窗口安全网"
+else
+  ok "没有运行中的 claude 会话（压缩窗口由 ccgo 按会话注入）"
+fi
+echo "     卡死的会话不用等：scripts/ccpod-rescue.py <session-id> 做一份清掉旧工具输出的副本，新窗口 --resume 它（不经过模型）"
 
 # ─── 模型清单对账 ────────────────────────────────────────────
 # 2026-10-05 事故：yescode 的 Fable 5.1 一直能用却没人用上——网关里的模型清单是手抄的，上游上新没人对账；
@@ -537,6 +595,145 @@ else
     ok "helper/sudoers/看门狗齐备，当前 SleepDisabled=${sleep_status:-未知}"
   else
     bad "看门狗 LaunchAgent 未加载，修复: sudo $REPO_DIR/scripts/sleep-switch/provision-sleep-switch.sh install"
+  fi
+fi
+
+# ─── 优惠雷达 ─────────────────────────────────────────────────
+# 源在本仓 → 装到 ~/.claude/bin/ 的副本缺席就是安装坏了，计 FAILURES。
+# 但「仓库版比安装版新」不计失败：PromotionService.resolveScript() 启动时会自动同步，
+# 手改仓库后没重启 App 是正常中间态，报 ❌ 只会让人以为坏了。
+echo
+echo "优惠雷达"
+PROMO_SCRIPT="$HOME/.claude/bin/promo-fetch.py"
+PROMO_RULES="$HOME/.claude/bin/promo-rules.json"
+PROMO_REDACT="$HOME/.claude/bin/cchandoff.py"
+REPO_PROMO_SCRIPT="$REPO_DIR/scripts/promo-fetch.py"
+REPO_PROMO_RULES="$REPO_DIR/scripts/promo-rules.json"
+REPO_PROMO_REDACT="$REPO_DIR/scripts/cchandoff.py"
+
+# 三个源文件缺一不可：promo-fetch.py 靠 cchandoff.py 的 redact() 脱敏错误，
+# 漏了后者会 ImportError 直接崩溃——静默失效里最坏的一种（面板只显示「找不到」，
+# 不说为什么）。所以这里显式点三个名字，而不是靠「抓取器试跑」间接暴露。
+if [[ ! -f "$REPO_PROMO_SCRIPT" || ! -f "$REPO_PROMO_RULES" || ! -f "$REPO_PROMO_REDACT" ]]; then
+  bad "仓库里缺优惠雷达源文件（scripts/promo-fetch.py / cchandoff.py / promo-rules.json）"
+elif [[ ! -f "$PROMO_SCRIPT" || ! -f "$PROMO_RULES" || ! -f "$PROMO_REDACT" ]]; then
+  bad "运行时副本缺失，修复: $REPO_DIR/install.sh"
+else
+  # 真跑一次：空清单 → 零网络、零副作用，但能证明「脚本活着 + 规则能解析 + 输出是 Swift 吃得下的 JSON」。
+  # 只查退出码不算证据（纪律第 1 条）——要断言 stdout 里那两个字段真的在。
+  promo_out="$(printf '[]' | python3 "$PROMO_SCRIPT" --rules "$PROMO_RULES" 2>/dev/null)" || promo_out=""
+  if [[ "$promo_out" == *'"schema": 1'* && "$promo_out" == *'"pages": []'* ]]; then
+    ok "抓取器试跑通过（空清单 → schema 1 / pages []）"
+  else
+    bad "抓取器试跑失败，输出不是预期 JSON。手工复现: printf '[]' | python3 $PROMO_SCRIPT --rules $PROMO_RULES"
+  fi
+
+  # 规则文件本身要能被解析且 schema 对得上：规则坏了不会报错，只会让每条线路都「读不出优惠」，
+  # 而那种静默正是这个功能最怕的失效模式。
+  if python3 -c 'import json,sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+assert isinstance(d.get("rules"), list) and d["rules"], "rules 不是非空数组"
+assert d.get("schema") == 1, "schema 不是 1"
+ids = [r.get("id") for r in d["rules"]]
+assert len(ids) == len(set(ids)), "规则 id 重复"' "$PROMO_RULES" 2>/dev/null; then
+    ok "规则文件可解析（schema 1、$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))["rules"]))' "$PROMO_RULES") 条规则、id 不重复）"
+  else
+    bad "规则文件坏了: ${PROMO_RULES}（跑一遍上面那条 python3 -c 看具体断言）"
+  fi
+
+  # 版本漂移：仓库比安装新 = App 下次启动会自动同步，只提示
+  for pair in "$REPO_PROMO_SCRIPT:$PROMO_SCRIPT" "$REPO_PROMO_RULES:$PROMO_RULES" "$REPO_PROMO_REDACT:$PROMO_REDACT"; do
+    src="${pair%%:*}"; dst="${pair##*:}"
+    if [[ "$src" -nt "$dst" ]]; then
+      warn "$(basename "$dst") 比仓库版旧（App 启动时会自动同步，急用可重跑 install.sh）"
+    fi
+  done
+  if ! { [[ "$REPO_PROMO_SCRIPT" -nt "$PROMO_SCRIPT" ]] || [[ "$REPO_PROMO_RULES" -nt "$PROMO_RULES" ]] || [[ "$REPO_PROMO_REDACT" -nt "$PROMO_REDACT" ]]; }; then
+    ok "运行时副本与仓库版同步"
+  fi
+
+  # 情报落盘文件：存在才查权限。这两个文件不含密钥，但按项目约定「可能含敏感内容的写 600」，
+  # PromotionStore.write 显式设过，这里守住它别被别的写法改回去。
+  for f in "$HOME/.claude/ccpod-promotions.json" "$HOME/.claude/ccpod-promotions-state.json"; do
+    if [[ -f "$f" ]]; then
+      perm="$(stat -f '%Lp' "$f")"
+      if [[ "$perm" == "600" ]]; then
+        ok "$(basename "$f") 权限 600"
+      else
+        bad "$(basename "$f") 权限是 ${perm}，应为 600（PromotionStore.write 的 setAttributes 没生效？）"
+      fi
+    fi
+  done
+
+  # 一条线路都没配优惠页是合法状态，不是故障
+  if ls "$HOME"/.claude/providers/*.json >/dev/null 2>&1 \
+     && grep -lq '"promo_url"' "$HOME"/.claude/providers/*.json 2>/dev/null; then
+    ok "已有线路配置了优惠页"
+  else
+    warn "还没有线路配优惠页（合法状态：在菜单栏「管线管理」里填一个公开定价页网址）"
+  fi
+fi
+# ─── Nightwatch 夜间守门人（可选功能）────────────────────────────
+# 未安装是合法状态（功能可选、默认关闭），只提示不计 FAILURES；
+# 装了一半（副本缺 / hooks 三组不齐）或白天 mode=on 忘关才算问题。
+# 深度自检（母本一致性/残留传播/redact import）归 ccnight doctor。
+echo
+echo "Nightwatch"
+NW_HOOK="$HOME/.claude/bin/nightwatch-hook.py"
+NW_CLI="$HOME/.claude/bin/ccnight"
+NW_SETTINGS="$HOME/.claude/settings.json"
+NW_DATA="$HOME/.claude/nightwatch"
+if [[ ! -e "$NW_HOOK" && ! -e "$NW_CLI" ]]; then
+  ok "未安装（可选功能；安装: scripts/nightwatch/install.sh）"
+else
+  [[ -x "$NW_HOOK" ]] || bad "hook 副本缺失或不可执行: $NW_HOOK"
+  [[ -x "$NW_CLI" ]] || bad "ccnight 副本缺失或不可执行: $NW_CLI"
+  if [[ -f "$NW_SETTINGS" ]]; then
+    nw_missing="$(python3 - "$NW_SETTINGS" <<'PYEOF'
+import json, sys
+try:
+    hooks = json.load(open(sys.argv[1], encoding="utf-8")).get("hooks", {})
+except Exception:
+    print("parse-error"); sys.exit(0)
+need = {"PreToolUse": "AskUserQuestion|ExitPlanMode",
+        "Notification": "permission_prompt|idle_prompt|agent_needs_input",
+        "StopFailure": "rate_limit|authentication_failed|billing_error|account_on_hold|server_error"}
+missing = [ev for ev, m in need.items()
+           if not any(g.get("matcher") == m
+                      and any("nightwatch-hook.py" in (h.get("command") or "")
+                              for h in g.get("hooks", []))
+                      for g in hooks.get(ev, []))]
+print(",".join(missing) if missing else "all")
+PYEOF
+)"
+    if [[ "$nw_missing" == "all" ]]; then
+      ok "settings hooks 三组注册齐（PreToolUse/Notification/StopFailure）"
+    elif [[ "$nw_missing" == "parse-error" ]]; then
+      warn "settings.json 解析失败（其他检查节应已同时报错）"
+    else
+      bad "settings hooks 缺组: ${nw_missing}（修复: scripts/nightwatch/install.sh）"
+    fi
+  else
+    bad "settings.json 不存在: $NW_SETTINGS"
+  fi
+  if [[ -d "$NW_DATA" ]]; then
+    nw_perm="$(stat -f '%Lp' "$NW_DATA" 2>/dev/null)"
+    if [[ "$nw_perm" == "700" ]]; then
+      ok "运行态目录权限 700: $NW_DATA"
+    else
+      warn "运行态目录权限过宽（${nw_perm}，应 700；asks/ 可能含粘贴密钥）: chmod 700 $NW_DATA"
+    fi
+    if [[ -f "$NW_DATA/mode.json" ]]; then
+      nw_mode="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("mode","off"))' "$NW_DATA/mode.json" 2>/dev/null || echo unknown)"
+      nw_hour="$(date +%H)"
+      if [[ "$nw_mode" == "on" && "$nw_hour" -ge 8 && "$nw_hour" -lt 22 ]]; then
+        warn "白天夜间模式还开着（mode=on）——关掉: ccnight off"
+      else
+        ok "mode=${nw_mode}"
+      fi
+    else
+      ok "mode.json 不存在（默认 off）"
+    fi
   fi
 fi
 

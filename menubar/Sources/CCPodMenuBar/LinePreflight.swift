@@ -78,6 +78,8 @@ enum LinePreflight {
         let detail = Self.detail(body, apiKey: apiKey)
         let modelRejected = lower.contains("model") &&
             (lower.contains("not exist") || lower.contains("not found") || lower.contains("invalid"))
+        // 火山 ModelNotOpen（404）："Your account … has not activated the model X"——key 和端点都对，是账号没开通
+        let modelNotOpen = lower.contains("modelnotopen") || lower.contains("not activated") || body.contains("未开通")
         let noBalance = lower.contains("insufficient") || lower.contains("balance")
             || lower.contains("arrear") || lower.contains("quota")
 
@@ -92,9 +94,17 @@ enum LinePreflight {
             var message = "实测通过"
             if actual != model { message += "；注意：端点把「\(model)」实际路由到了「\(actual)」" }
             return Outcome(ok: true, message: message, actualModel: actual)
+        case _ where modelNotOpen:
+            return Outcome(ok: false,
+                           message: "key 和地址都对，但账号还没开通模型「\(model)」。去厂商控制台开通该模型（火山：方舟控制台 → 开通管理），或换一个已开通的模型名\(detail)",
+                           actualModel: nil)
         case 404:
             if modelRejected {
                 return Outcome(ok: false, message: "端点不认识模型「\(model)」（404）。换官方文档里的模型名\(detail)", actualModel: nil)
+            }
+            if upstreamMessage(body) != nil {
+                // 有结构化错误体 = 端点存在且在说话，不是"路径不存在"；如实转述上游原因
+                return Outcome(ok: false, message: "端点拒绝了这次请求（404）\(detail)", actualModel: nil)
             }
             return Outcome(ok: false,
                            message: "这个地址不说 Anthropic 协议（404：/v1/messages 不存在）。常见原因是地址前缀少写或多写（如 /anthropic、/api/coding），去官方文档核对端点",
@@ -118,12 +128,28 @@ enum LinePreflight {
     }
 
     /// 错误摘要：截断并脱敏——绝不回显 key 本身。
+    /// 优先取上游 JSON 里的 error.message（人能读的那句），取不到才用原始 body；上限 400 字，界面可滚动复制。
     private static func detail(_ body: String, apiKey: String) -> String {
-        var text = String(body.prefix(120))
+        var text = String((upstreamMessage(body) ?? body).prefix(400))
         if apiKey.count >= 8 {
             text = text.replacingOccurrences(of: apiKey, with: "***")
         }
         return text.isEmpty ? "" : "：\(text)"
+    }
+
+    /// 兼容 {"error":{"code","message"}}、{"error":"…"}、{"message":"…"}；带上 code 便于搜索
+    static func upstreamMessage(_ body: String) -> String? {
+        guard let data = body.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        if let err = obj["error"] as? [String: Any] {
+            let msg = (err["message"] as? String) ?? ""
+            let code = (err["code"] as? String) ?? (err["type"] as? String) ?? ""
+            let joined = [code, msg].filter { !$0.isEmpty }.joined(separator: " · ")
+            return joined.isEmpty ? nil : joined
+        }
+        if let err = obj["error"] as? String, !err.isEmpty { return err }
+        if let msg = obj["message"] as? String, !msg.isEmpty { return msg }
+        return nil
     }
 
     private static func jsonModel(from body: String) -> String? {

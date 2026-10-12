@@ -52,6 +52,29 @@ final class GatewayLineService: ObservableObject {
         }
     }
 
+    func setDefaultEffort(providerID: String, effort: String?, completion: @escaping (String?) -> Void) {
+        queue.async {
+            let error: String?
+            do {
+                let directory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/providers")
+                try Self.saveDefaultEffort(providerID: providerID, effort: effort, directory: directory)
+                error = nil
+            } catch let failure { error = gatewayVisibleText(failure.localizedDescription) }
+            DispatchQueue.main.async { completion(error) }
+        }
+    }
+
+    func setPromoURL(providerID: String, url: String?, completion: @escaping (String?) -> Void) {
+        queue.async {
+            let error: String?
+            do {
+                try Self.savePromoURL(providerID: providerID, url: url, directory: Self.providersDirectory)
+                error = nil
+            } catch let failure { error = gatewayVisibleText(failure.localizedDescription) }
+            DispatchQueue.main.async { completion(error) }
+        }
+    }
+
     static func pipelineID(_ provider: String) -> String {
         let digest = SHA256.hash(data: Data(provider.utf8)).prefix(4).map { String(format: "%02x", $0) }.joined()
         return "gw-" + String(provider.prefix(100)) + "-" + digest
@@ -145,6 +168,24 @@ final class GatewayLineService: ObservableObject {
             } else if !manual, let notice = previous?["model_notice"] as? String {
                 lines[id]?["model_notice"] = notice
             }
+            // 思考强度是用户设置，上面整份重建会丢掉它，必须显式带过来
+            if let effort = previous?["effort"] as? String, effortLevels.contains(effort) {
+                lines[id]?["effort"] = effort
+            }
+            // 优惠页 URL 也是用户设置，同样会被上面整份重建丢掉，必须显式带过来。
+            // 与 effort 同一个坑：漏了不会报错，只会让用户填的 URL 某天悄悄消失。
+            if let promoURL = previous?["promo_url"] as? String, isValidPromoURL(promoURL) {
+                lines[id]?["promo_url"] = promoURL
+            }
+            // 压缩窗口同理（524 冷读安全网，2026-10-10）：整份重建会丢掉它，必须显式带过来。
+            // 校验口径与 scripts/lib/line_models.py 一致：100000–1000000 的整数或 "off"。
+            if let window = previous?["auto_compact_window"] {
+                if let value = window as? Int, (100000...1000000).contains(value) {
+                    lines[id]?["auto_compact_window"] = value
+                } else if let off = window as? String, off == "off" {
+                    lines[id]?["auto_compact_window"] = off
+                }
+            }
         }
         return lines
     }
@@ -208,6 +249,64 @@ final class GatewayLineService: ObservableObject {
         line["model_selection"] = "manual"
         line.removeValue(forKey: "model_notice")
         line["claude_args"] = ["--model", route]
+        try writeLine(line, to: directory.appendingPathComponent(providerID + ".json"))
+    }
+
+    /// Claude Code `--effort` 接受的档位，与 scripts/lib/line_models.py 的 EFFORTS 一致。
+    static let effortLevels = ["low", "medium", "high", "xhigh", "max"]
+
+    /// nil = 删掉字段：启动不带 --effort，跟随全局 effortLevel。只影响之后启动或重启的会话。
+    static func saveDefaultEffort(providerID: String, effort: String?, directory: URL) throws {
+        guard var line = providerConfiguration(providerID, directory: directory), line["source"] as? String == "gateway" else {
+            throw failure("该管线不支持设置思考强度，请刷新后重试")
+        }
+        if let effort {
+            guard effortLevels.contains(effort) else { throw failure("思考强度无效：\(effort)") }
+            line["effort"] = effort
+        } else {
+            line.removeValue(forKey: "effort")
+        }
+        try writeLine(line, to: directory.appendingPathComponent(providerID + ".json"))
+    }
+
+    /// `~/.claude/providers`。上面三个实例方法（refresh / setDefaultModel / setDefaultEffort）
+    /// 各自内联了同一条字面量，这里给外部调用方一个入口，不抄第四遍。
+    /// PromotionService 要用它读线路清单（Task 7）。
+    static var providersDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/providers")
+    }
+
+    /// 优惠页 URL 校验。**只收 http/https**：
+    /// `file://` 会让 `/etc/passwd` 之类的本地文件内容被抓进情报面板，
+    /// 那是把本地信息搬到 UI 上，不是这个功能该做的事。
+    static func isValidPromoURL(_ raw: String) -> Bool {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let url = URL(string: trimmed) else { return false }
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return false }
+        guard let host = url.host, !host.isEmpty, host.contains(".") || host == "localhost" else { return false }
+        return true
+    }
+
+    /// nil = 删掉字段（这条线路不再收优惠情报）。
+    /// 与 saveDefaultEffort 同一套不变量：只在 gateway 管线上生效、拒绝时不动文件、写盘 600。
+    static func savePromoURL(providerID: String, url: String?, directory: URL) throws {
+        guard var line = providerConfiguration(providerID, directory: directory),
+              line["source"] as? String == "gateway" else {
+            throw failure("该管线不支持设置优惠页，请刷新后重试")
+        }
+        if let url {
+            guard isValidPromoURL(url) else {
+                let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty, let scheme = URL(string: trimmed)?.scheme?.lowercased(),
+                   scheme != "http" && scheme != "https" {
+                    throw failure("优惠页地址无效：只支持 http / https（收到 \(scheme)://）")
+                }
+                throw failure("优惠页地址无效：请填一个公开的定价或活动页完整网址")
+            }
+            line["promo_url"] = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            line.removeValue(forKey: "promo_url")
+        }
         try writeLine(line, to: directory.appendingPathComponent(providerID + ".json"))
     }
 

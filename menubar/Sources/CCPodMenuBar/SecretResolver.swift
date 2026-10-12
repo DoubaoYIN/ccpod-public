@@ -123,6 +123,17 @@ enum SecretResolver {
         }
     }
 
+    /// 删除钥匙串条目（删线路时清掉它专属的 key，免得留孤儿密钥）。条目不存在不算错。
+    static func deleteKeychain(service: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["delete-generic-password", "-s", service]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
+    }
+
     /// 回读校验：写进去和读出来必须一致，否则宁可报错也不要把引用写进配置文件
     /// （那会留下一条"看起来配好了、其实取不到 key"的线路）
     static func readKeychain(service: String) -> String? {

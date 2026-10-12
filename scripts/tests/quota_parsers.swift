@@ -278,6 +278,38 @@ import Foundation
         expect(dsReq.first?.url?.absoluteString == "https://api.deepseek.com/user/balance"
                && dsReq.first?.value(forHTTPHeaderField: "Authorization") == "Bearer sk-unit", "DeepSeek请求", "")
 
+        // 7. G2 chip 纯函数（spec 2026-10-10）：alertLevel / boundedWindows / tooltipLine / tightestChain
+        expect(AlertLevel.from(remainingRatio: 0.26) == .ok, "alertLevel 26%=ok", "")
+        expect(AlertLevel.from(remainingRatio: 0.25) == .warn, "alertLevel 25%=warn（边界含）", "")
+        expect(AlertLevel.from(remainingRatio: 0.11) == .warn, "alertLevel 11%=warn", "")
+        expect(AlertLevel.from(remainingRatio: 0.10) == .critical, "alertLevel 10%=critical（边界含）", "")
+        expect(AlertLevel.from(remainingRatio: nil) == .ok, "alertLevel 钱包(nil)=ok", "")
+        if let glm {
+            expect(glm.boundedWindows.map(\.period) == [.fiveHour, .week],
+                   "GLM boundedWindows 序=短→长", "实际：\(glm.boundedWindows.map(\.period))")
+            let weekW = glm.windows.first { $0.period == .week }!
+            let fiveW = glm.windows.first { $0.period == .fiveHour }!
+            expect(weekW.alertLevel == .ok && fiveW.alertLevel == .ok, "GLM 两窗健康=ok", "")
+            // 用窗口自己的 resetAt 构造 now，摆脱测试运行日期依赖
+            let after = weekW.resetAt!.addingTimeInterval(3600)   // 两窗 reset 都已过
+            let chain = glm.tightestChain(now: after)
+            expect(chain == "从最紧排：本周剩 65% → 5 小时剩 95%",
+                   "GLM 链句（reset 已过不带时间）", "实际：\(chain ?? "nil")")
+            let before = weekW.resetAt!.addingTimeInterval(-3600) // 本周 reset 未过、5 小时已过
+            let chainR = glm.tightestChain(now: before)
+            expect(chainR?.hasPrefix("从最紧排：本周剩 65%（") == true
+                   && chainR!.contains("重置） → 5 小时剩 95%"),
+                   "GLM 链句（未过的 reset 带时间、已过的不带）", "实际：\(chainR ?? "nil")")
+            expect(glm.tooltipLine(now: after) == "GLM Coding Pro · 5 小时剩 95% · 本周剩 65%",
+                   "GLM tooltip=套餐名+短→长双窗", "实际：\(glm.tooltipLine(now: after))")
+        }
+        let aliyun = QuotaAdapters.parseAliyun(provider: "aliyun", data: fixture("aliyun-subscription-stats.json"))
+        expect(aliyun?.tightestChain() == nil, "单窗无链句", "实际：\(aliyun?.tightestChain() ?? "nil")")
+        expect(ds != nil && ds!.tooltipLine() == ds!.tightestWindow?.summaryText,
+               "钱包 tooltip 退化为余额句", "实际：\(ds?.tooltipLine() ?? "nil")")
+        let dead = BalanceInfo.status(.notIntegrated(reason: "未接入额度查询"), provider: "x")
+        expect(dead.tooltipLine() == "未接入额度查询", "非ok tooltip=状态原因", "实际：\(dead.tooltipLine())")
+
         print(failures.isEmpty ? "\n全部通过" : "\n失败 \(failures.count) 项：\(failures)")
         exit(failures.isEmpty ? 0 : 1)
     }

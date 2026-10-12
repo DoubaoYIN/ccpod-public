@@ -115,7 +115,8 @@ final class ErrorDiagnosisService {
         onPreview: @escaping (ErrorDiagnosisResult) -> Void,
         onFinal: @escaping (Result<ErrorDiagnosisResult, Error>) -> Void
     ) {
-        let trimmed = errorText.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 发给诊断模型之前先脱敏：粘贴的报错常带 key，原来只在存历史时脱敏，发出去的是原文（2026-10-09 线路状态审查）
+        let trimmed = SecretRedactor.redact(errorText.trimmingCharacters(in: .whitespacesAndNewlines))
         guard !trimmed.isEmpty else {
             onFinal(.failure(ErrorDiagnosisError.emptyInput))
             return

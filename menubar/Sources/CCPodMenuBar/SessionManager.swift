@@ -22,6 +22,12 @@ struct SessionInfo: Codable {
         kill(pid_t(pid), 0) == 0
     }
 
+    /// 有没有真实终端：登记表写不出 tty 时给 "unknown"，发现层拿 ps 的 `??`（无 TTY）或 `?`（取不到）。
+    /// 只有 true 的行才有窗口可以切过去。
+    var hasTerminal: Bool {
+        !(tty.isEmpty || tty == "??" || tty == "?" || tty == "unknown")
+    }
+
     // ccgo bash 的直接父进程正常是 zsh/login；终端窗口被关、shell 退出后，
     // ccgo 会被 launchd（pid=1）收养。直接 ppid==1 即孤儿。
     // 注意：不能爬整条 PPID 链——Ghostty 这类 GUI 进程自身的 ppid 也是 1。
@@ -100,6 +106,17 @@ struct SessionInfo: Codable {
         let isStuck = ccStatus == "busy" && Date().timeIntervalSince1970 - lastTs > 600
         return SessionHudState(glyph: isStuck ? "⚠️" : glyph, task: task, tool: tool,
                                lastTs: Date(timeIntervalSince1970: lastTs), isStuck: isStuck)
+    }
+
+    /// session-hud hook 给这条 tty 的分屏写的标题（`/tmp/claude-tab-state/<tty小名>.json` 的 `title`）。
+    /// Ghostty 的分屏没有 tty 属性，切窗口只能拿这个名字去对。路径规则与 `hudState` 同一处维护（PITFALLS #39）。
+    static func hookTitle(tty: String) -> String? {
+        let ttyName = (tty as NSString).lastPathComponent
+        guard !ttyName.isEmpty, ttyName != "??",
+              let data = try? Data(contentsOf: URL(fileURLWithPath: "/tmp/claude-tab-state/\(ttyName).json")),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let title = obj["title"] as? String, !title.isEmpty else { return nil }
+        return title
     }
 
     private static func procInfo(of pid: pid_t) -> (ppid: pid_t, pgid: pid_t)? {

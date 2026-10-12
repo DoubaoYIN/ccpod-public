@@ -29,8 +29,14 @@ struct ErrorDiagnosisView: View {
     @State private var selectedEntryId: UUID? = nil
     @State private var currentModel: String = ""
     @State private var detailExpanded: Bool = false
+    @State private var autoErrorsExpanded: Bool = true
 
-    init() {
+    let autoDetectedErrors: [(name: String, error: String)]
+
+    /// 用数组不用字典：显示名可能重名（中文名是用户自己起的），字典会悄悄吞掉一条
+    init(autoDetectedErrors: [(name: String, error: String)] = []) {
+        // 按线路名排序，方便查找
+        self.autoDetectedErrors = autoDetectedErrors.sorted { $0.name < $1.name }
         if let cfg = ErrorDiagnosisService.shared.loadPrimaryConfig() {
             _currentModel = State(initialValue: cfg.model)
         }
@@ -136,6 +142,12 @@ struct ErrorDiagnosisView: View {
 
     private var mainPane: some View {
         VStack(alignment: .leading, spacing: 10) {
+            // 自动识别的错误（如果有）
+            if !autoDetectedErrors.isEmpty {
+                autoDetectedErrorsSection
+                Divider()
+            }
+
             HStack {
                 Text("粘贴错误内容")
                     .font(.system(size: 12, weight: .semibold))
@@ -328,6 +340,81 @@ struct ErrorDiagnosisView: View {
                 }
             }
         }
+    }
+
+    // MARK: - Auto-detected errors section
+
+    private var autoDetectedErrorsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button(action: { autoErrorsExpanded.toggle() }) {
+                HStack(spacing: 6) {
+                    Image(systemName: autoErrorsExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text("线路状态里的问题")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.primary)
+                    Text("(\(autoDetectedErrors.count) 条)")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                    Spacer()
+                }
+            }
+            .buttonStyle(.plain)
+
+            if autoErrorsExpanded {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(autoDetectedErrors.enumerated()), id: \.offset) { _, item in
+                            autoErrorRow(name: item.name, error: item.error)
+                        }
+                    }
+                }
+                .frame(maxHeight: 200)
+                .padding(.leading, 20)
+            }
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func autoErrorRow(name: String, error: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(.orange)
+                Text(name)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.primary)
+                Spacer()
+                Button(action: { inputText = error }) {
+                    HStack(spacing: 3) {
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 10))
+                        Text("填入诊断")
+                            .font(.system(size: 10))
+                    }
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.accentColor)
+                .help("把这个错误填入下方诊断框")
+            }
+
+            Text(error.prefix(120) + (error.count > 120 ? "…" : ""))
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .lineLimit(2)
+                .textSelection(.enabled)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.orange.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(Color.orange.opacity(0.2), lineWidth: 0.5)
+        )
     }
 
     // MARK: - Actions

@@ -29,7 +29,24 @@ struct ProviderManagerView: View {
     @State private var pendingDelete: ProviderConfig?
     @State private var errorMessage: String?
     @State private var balances: [String: BalanceInfo] = [:]
+    /// 点开了报错详情的管线：报错默认收起，只挂 ⚠️，点了才展开全文
+    @State private var shownProblems: Set<String> = []
+    /// 优惠页地址的编辑草稿，key = cfg.name。
+    /// 用字典而不是单个 @State：管线列表里多行同时可见，共用一个草稿会互相串。
+    /// 键不存在 = 用户没编辑过这一行，此时直接显示已保存值（见 promoDraftBinding）。
+    @State private var promoDrafts: [String: String] = [:]
+    /// 线路/网关上游名 → key 指纹（多账号时对号入座）
+    @State private var fingerprints: [String: String] = [:]
+    /// 从弹窗「添加管线…」进来时，窗口一出现就弹添加表单
+    var openAddOnAppear = false
+    /// 从弹窗某条直连线路的「编辑此线路」进来时，窗口一出现就弹这条线路的编辑框
+    /// （原来只打开整个管理窗口，还得自己再找那条线路，2026-10-09）
+    var openEditOnAppear: String? = nil
     var onChange: (() -> Void)?
+    /// 窗口已开着时再点「添加管线…」：窗口不重建，靠通知弹表单
+    static let openAddNotification = Notification.Name("ccpod.providerManager.openAdd")
+    /// 同上，「编辑此线路」：object = 线路名
+    static let openEditNotification = Notification.Name("ccpod.providerManager.openEdit")
 
     private let providersDir: URL = {
         FileManager.default.homeDirectoryForCurrentUser
@@ -78,8 +95,19 @@ struct ProviderManagerView: View {
                 secondaryButton: .cancel(Text("取消"))
             )
         }
-        .onAppear {
+        .onReceive(NotificationCenter.default.publisher(for: Self.openAddNotification)) { _ in
+            showAddSheet = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: Self.openEditNotification)) { note in
+            guard let name = note.object as? String else { return }
             load()
+            editing = providers.first { $0.name == name }
+        }
+        .onAppear {
+            if openAddOnAppear { showAddSheet = true }
+            loadFingerprints()
+            load()
+            if let name = openEditOnAppear { editing = providers.first { $0.name == name } }
             loadCachedBalances()
             gatewayLines.refresh { load(); onChange?() }
         }
@@ -146,7 +174,7 @@ struct ProviderManagerView: View {
                 if cfg.extras["source"] as? String == "gateway" {
                     Text("来自网关")
                         .font(.system(size: 10)).foregroundColor(.secondary)
-                        .help("管线由网关同步，可在此设置默认模型")
+                        .help("管线由网关同步，可在此设置默认模型和思考强度")
                 } else {
                 Button(action: { editing = cfg }) {
                     Image(systemName: "pencil")
@@ -172,8 +200,20 @@ struct ProviderManagerView: View {
             }
 
             VStack(alignment: .leading, spacing: 3) {
+                if shownProblems.contains(cfg.name), let detail = HealthService.shared.cached(cfg.name)?.detail {
+                    Text(detail)
+                        .font(.system(size: 11))
+                        .foregroundColor(.red)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if cfg.extras["source"] as? String == "gateway" {
                     defaultModelPicker(cfg)
+                    // 优惠页只对 gateway 管线开放：PromotionService 的清单就是从
+                    // GatewayLineService.readLines 建的，非 gateway 条目填了也没人抓。
+                    // 与其让它填了没用，不如一开始就不显示。
+                    promoURLField(cfg)
+                        .padding(.top, 4)
                 }
                 if cfg.extras["source"] as? String != "gateway", !cfg.baseURL.isEmpty {
                     HStack(spacing: 6) {
@@ -185,7 +225,15 @@ struct ProviderManagerView: View {
                             .truncationMode(.middle)
                     }
                 }
-                if cfg.keyIsSecretRef {
+                if let fp = fingerprints[(cfg.extras["gateway_provider"] as? String) ?? cfg.name] {
+                    HStack(spacing: 4) {
+                        Image(systemName: "key.fill")
+                        Text(cfg.keyIsSecretRef ? "钥匙串 · 指纹 \(fp)" : "网关 · 指纹 \(fp)")
+                    }
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .help("key 的 SHA256 前 6 位：同一把 key 指纹相同，用来区分同厂商的不同账号；不可还原出 key")
+                } else if cfg.keyIsSecretRef {
                     HStack(spacing: 4) {
                         Image(systemName: "key.fill")
                         Text("密钥保存在钥匙串")
@@ -222,6 +270,8 @@ struct ProviderManagerView: View {
     private func defaultModelPicker(_ cfg: ProviderConfig) -> some View {
         let models = cfg.extras["gateway_models"] as? [String] ?? []
         let current = cfg.extras["gateway_model"] as? String ?? ""
+        let savedEffort = cfg.extras["effort"] as? String ?? ""
+        let currentEffort = GatewayLineService.effortLevels.contains(savedEffort) ? savedEffort : ""
         return VStack(alignment: .leading, spacing: 4) {
             Picker("默认模型", selection: Binding(
                 get: { current },
@@ -252,12 +302,115 @@ struct ProviderManagerView: View {
             .font(.system(size: 12))
             .pickerStyle(.menu)
             .disabled(saving || gatewayLines.refreshing || models.isEmpty)
-            Text("用于新会话，已运行的会话保持原模型")
+            Picker("思考强度", selection: Binding(
+                get: { currentEffort },
+                set: { value in
+                    guard value != currentEffort, !saving else { return }
+                    saving = true
+                    errorMessage = nil
+                    gatewayLines.setDefaultEffort(providerID: cfg.name, effort: value.isEmpty ? nil : value) { error in
+                        saving = false
+                        if let error {
+                            errorMessage = gatewayVisibleText(error)
+                        } else {
+                            load()
+                            onChange?()
+                        }
+                    }
+                }
+            )) {
+                Text("跟随全局设置").tag("")
+                ForEach(GatewayLineService.effortLevels, id: \.self) { level in
+                    Text(level == "max" ? effortDisplayName(level) + "（最慢、最费额度）" : effortDisplayName(level)).tag(level)
+                }
+            }
+            .font(.system(size: 12))
+            .pickerStyle(.menu)
+            .disabled(saving || gatewayLines.refreshing)
+            .help("新会话启动时带 --effort，会话里仍可用 /effort 临时改；「跟随全局设置」= 不带参数，按 settings 的 effortLevel")
+            Text("用于新会话；运行中的会话可在会话菜单选「重启」套用，接着原对话")
                 .font(.system(size: 10)).foregroundColor(.secondary)
             if let notice = cfg.extras["model_notice"] as? String {
                 Text(gatewayVisibleText(notice)).font(.system(size: 10)).foregroundColor(.orange)
             }
         }
+    }
+
+    // MARK: - 优惠页地址（优惠雷达「跟着线路走」的入口，spec §9）
+
+    private func savedPromoURL(_ cfg: ProviderConfig) -> String {
+        cfg.extras["promo_url"] as? String ?? ""
+    }
+
+    /// 当前草稿，已去首尾空白。未编辑过时等于已保存值。
+    private func promoDraftValue(_ cfg: ProviderConfig) -> String {
+        (promoDrafts[cfg.name] ?? savedPromoURL(cfg))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func promoDraftBinding(_ cfg: ProviderConfig) -> Binding<String> {
+        Binding(
+            get: { promoDrafts[cfg.name] ?? savedPromoURL(cfg) },
+            set: { promoDrafts[cfg.name] = $0 }
+        )
+    }
+
+    /// value 传 nil = 用输入框里的草稿；传具体值 = 无视草稿（「清除」按钮走这条）。
+    /// 显式传参而不是先改 @State 再读：@State 的写虽然同步，但依赖它会让
+    /// 「点了清除却没清掉」这种 bug 只在某些渲染时序下出现，查起来要命。
+    private func commitPromoURL(_ cfg: ProviderConfig, value: String? = nil) {
+        let saved = savedPromoURL(cfg)
+        let draft = (value ?? promoDraftValue(cfg))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // 没变化就不写盘：省一次串行队列往返，也省一次 spinner 闪烁
+        guard draft != saved, !saving else { return }
+        saving = true
+        errorMessage = nil
+        gatewayLines.setPromoURL(providerID: cfg.name, url: draft.isEmpty ? nil : draft) { error in
+            saving = false
+            if let error {
+                // 文案已在 setPromoURL 里过 gatewayVisibleText；这里的报错直接露给用户看，
+                // 因为「地址无效」这类话用户必须能读懂才知道怎么改（用户偏好：UI 措辞别像报错码）
+                errorMessage = error
+                return
+            }
+            promoDrafts[cfg.name] = nil   // 清草稿，让 get 回到「显示已保存值」
+            load()
+            onChange?()
+        }
+    }
+
+    private func promoURLField(_ cfg: ProviderConfig) -> some View {
+        let saved = savedPromoURL(cfg)
+        let draft = promoDraftValue(cfg)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: "moon.stars")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                TextField("优惠页地址（公开的定价 / 活动页网址）", text: promoDraftBinding(cfg))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11))
+                    .onSubmit { commitPromoURL(cfg) }
+                Button("保存") { commitPromoURL(cfg) }
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 11))
+                    .disabled(saving || draft == saved)
+                if !saved.isEmpty {
+                    Button("清除") { commitPromoURL(cfg, value: "") }
+                        .buttonStyle(.borderless)
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .disabled(saving)
+                }
+            }
+            Text("填厂商公开的定价或活动页。每天 21:00 抓一次，只读、只提醒——不改你的线路，不改网关。")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+        }
+        .help("优惠雷达：抓这一页上的「分时段定价 / 限时优惠」，每天 21:30 汇总提醒。\n"
+            + "只读公开页，不发密钥、不动配置。目前只有阿里云百炼的分时段定价有规则能自动读懂；\n"
+            + "别的页填了也会在面板里标「⚠️ 读不出」，不会假装没事。")
     }
 
     @ViewBuilder
@@ -272,11 +425,23 @@ struct ProviderManagerView: View {
                     .help(health.status == .down ? (health.detail ?? "") : health.speedTooltip)
             }
             if let detail = health.detail {
-                Text(detail)
-                    .font(.system(size: 10))
-                    .foregroundColor(health.availabilityReason == .quotaExhaustedDaily ? .orange : (health.status == .down ? .red : .secondary))
-                    .lineLimit(1)
-                    .help(detail)
+                if health.status == .down || health.status == .exhausted {
+                    Button {
+                        if shownProblems.contains(provider) { shownProblems.remove(provider) } else { shownProblems.insert(provider) }
+                    } label: {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 10))
+                            .foregroundColor(.orange)
+                    }
+                    .buttonStyle(.plain)
+                    .help(shownProblems.contains(provider) ? "收起" : "有问题，点击查看")
+                } else {
+                    Text(detail)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .help(detail)
+                }
             }
         }
     }
@@ -468,10 +633,28 @@ struct ProviderManagerView: View {
         }
     }
 
+    private func loadFingerprints() {
+        let dir = providersDir
+        DispatchQueue.global(qos: .utility).async {
+            let entries = KeyFingerprint.loadAll(providersDir: dir)
+            var map: [String: String] = [:]
+            for e in entries { map[e.line] = e.fingerprint }
+            DispatchQueue.main.async { fingerprints = map }
+        }
+    }
+
     private func delete(_ cfg: ProviderConfig) {
         let url = providersDir.appendingPathComponent(cfg.name).appendingPathExtension("json")
         do {
             try FileManager.default.removeItem(at: url)
+            // 只删这条线路专属的条目（ccpod-line-<名称>），且别的线路没引用它
+            let service = "ccpod-line-\(cfg.name)"
+            if cfg.keyIsSecretRef,
+               (cfg.rawEnv[cfg.keyEnvName] as? [String: Any])?["$exec"] as? String == SecretResolver.keychainCommand(service: service),
+               !providers.contains(where: { $0.name != cfg.name
+                   && (($0.rawEnv[$0.keyEnvName] as? [String: Any])?["$exec"] as? String) == SecretResolver.keychainCommand(service: service) }) {
+                SecretResolver.deleteKeychain(service: service)
+            }
             errorMessage = nil
             balances.removeValue(forKey: cfg.name)
             load()

@@ -844,3 +844,54 @@ extension QuotaAdapters {
         return fmt.string(from: date) + " 重置"
     }
 }
+
+// MARK: - G2 chip 纯函数（spec 2026-10-10；不 import SwiftUI，颜色映射在视图层）
+
+/// 健康档：剩 ≤25% warn、≤10% critical（边界含）。驱动 chip 填充条与名字颜色。
+enum AlertLevel: Equatable {
+    case ok, warn, critical
+
+    static func from(remainingRatio: Double?) -> AlertLevel {
+        guard let ratio = remainingRatio else { return .ok }   // 钱包型无比例，按健康处理
+        if ratio <= 0.10 { return .critical }
+        if ratio <= 0.25 { return .warn }
+        return .ok
+    }
+}
+
+extension QuotaWindow {
+    var alertLevel: AlertLevel { AlertLevel.from(remainingRatio: remainingRatio) }
+}
+
+extension BalanceInfo {
+    /// 有总量的窗口（chip 只画这些）；顺序沿用 sortWindows（短→长）。
+    var boundedWindows: [QuotaWindow] { windows.filter { $0.total > 0 } }
+
+    /// 悬停 tooltip：套餐名 · 每窗「label 剩 X%（重置时间）」按短→长；钱包退化为余额句；非 ok 退化为状态原因。
+    func tooltipLine(now: Date = Date()) -> String {
+        if let message = status.message { return message }
+        let bounded = boundedWindows
+        guard !bounded.isEmpty else { return tightestWindow?.summaryText ?? "没有额度数据" }
+        var parts: [String] = []
+        if !planName.isEmpty { parts.append(planName) }
+        parts.append(contentsOf: bounded.map { Self.chainPhrase($0, now: now) })
+        return parts.joined(separator: " · ")
+    }
+
+    /// 展开区首行：bounded 窗按已用比例降序的链句；<2 窗返回 nil。
+    func tightestChain(now: Date = Date()) -> String? {
+        let bounded = boundedWindows
+        guard bounded.count >= 2 else { return nil }
+        let chain = bounded
+            .sorted { ($0.progress ?? 0) > ($1.progress ?? 0) }
+            .map { Self.chainPhrase($0, now: now) }
+        return "从最紧排：" + chain.joined(separator: " → ")
+    }
+
+    /// 「本周剩 65%（10/12 08:26 重置）」；reset 已过则不带括号。
+    private static func chainPhrase(_ window: QuotaWindow, now: Date) -> String {
+        var s = "\(window.label)剩 \(window.remainingPercent ?? 0)%"
+        if let reset = window.resetAt, reset > now { s += "（\(QuotaAdapters.resetPhrase(reset, now: now))）" }
+        return s
+    }
+}

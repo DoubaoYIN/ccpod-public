@@ -2,6 +2,14 @@ import SwiftUI
 
 final class PopoverViewModel: ObservableObject {
     @Published var providers: [String] = []
+    /// 直连线路：不经本机网关的线路（火山、MiniMax、DeepSeek…），体检脚本只管网关，不在 lineCheck.lines 里。
+    /// 弹窗「线路状态」和错误诊断窗口共用这一份判定。
+    var directLines: [String] {
+        providers.filter { id in
+            guard let config = providerConfiguration(id) else { return false }
+            return !isLocalGatewayConfiguration(config) && config["env"] != nil
+        }
+    }
     @Published var projects: [ProjectInfo] = []
     @Published var terminals: [String] = []
     @Published var sessions: [SessionInfo] = []
@@ -10,23 +18,47 @@ final class PopoverViewModel: ObservableObject {
     @Published var sessionHud: [Int: SessionHudState] = [:]
     /// pid → claude 会话 id。有这个才显示重命名按钮（改标题要按 id 定位会话文件）
     @Published var sessionIDs: [Int: String] = [:]
+    /// 任一 Picker/Menu 选择变化后触发：NSMenu tracking 会让 popover 窗口失 key
+    /// （click-through，第一下白点，#265），StatusController 借此异步复位 makeKey。
+    var onPickerChanged: (() -> Void)?
     var onRename: ((SessionInfo) -> Void)?
+    /// 点整行：把这个会话所在的终端分屏/窗口切到前台（只对有 TTY 的行开放）
+    var onFocus: ((SessionInfo) -> Void)?
     /// 登记表读/解析异常。非 nil 时要在会话卡里说出来——这个产品已经因为
     /// "空状态不解释原因"被投诉过两次，不能再让用户猜。
     @Published var registryWarning: String?
 
-    @Published var selectedProvider: String = ""
-    @Published var selectedProject: String = ""
-    @Published var selectedTerminal: String = ""
+    @Published var selectedProvider: String = "" {
+        didSet { if selectedProvider != oldValue { resetLaunchChoice(); onPickerChanged?() } }
+    }
+    @Published var selectedProject: String = "" {
+        didSet { if selectedProject != oldValue { onPickerChanged?() } }
+    }
+    @Published var selectedTerminal: String = "" {
+        didSet { if selectedTerminal != oldValue { onPickerChanged?() } }
+    }
+    /// 启动表单的「模型 / 思考」：空串 = 管线默认（不带参数）。只管这一次启动，换管线或启动后都回到默认。
+    @Published var launchModel: String = "" {
+        didSet { if launchModel != oldValue { onPickerChanged?() } }
+    }
+    @Published var launchEffort: String = "" {
+        didSet { if launchEffort != oldValue { onPickerChanged?() } }
+    }
+    @Published var launchOptions = LaunchOptions.make(config: nil)
 
     @Published var balances: [String: BalanceInfo] = [:]
     @Published var healthStates: [String: HealthInfo] = [:]
     var onShowProviderManager: (() -> Void)?
+    /// 直达「添加管线」：开管线管理窗口并立刻弹出添加表单（省掉中间几次点击）
+    var onAddProvider: (() -> Void)?
+    /// 直连线路的「编辑此线路」：打开管线管理并直接弹出这条线路的编辑框
+    var onEditDirectLine: ((String) -> Void)?
     var onSpeedTest: (() -> Void)?
     var onManageProjects: (() -> Void)?
     var onShowErrorDiagnosis: (() -> Void)?
+    var onShowPromotionRadar: (() -> Void)?
 
-    var onLaunch: ((String, String, String) -> Void)?
+    var onLaunch: ((String, String, String, String?, String?) -> Void)?
     var onSwitch: ((SessionInfo, String) -> Void)?
     var onRecover: ((SessionInfo, String) -> Void)?
     var onClose: ((SessionInfo) -> Void)?
@@ -60,6 +92,9 @@ final class PopoverViewModel: ObservableObject {
             // 默认跟随 TerminalRegistry 的默认终端（iTerm2）
             selectedTerminal = TerminalRegistry.shared.defaultAdapter.name
         }
+        // 管线默认值可能刚在「管线管理」改过；已选的模型若不在新清单里就回到默认
+        launchOptions = LaunchOptions.make(config: providerConfiguration(selectedProvider))
+        if !launchModel.isEmpty && !launchOptions.models.contains(launchModel) { launchModel = "" }
 
         loadCachedBalances()
         loadCachedHealth()
@@ -67,6 +102,12 @@ final class PopoverViewModel: ObservableObject {
             refreshBalances(force: true)
             refreshHealth(force: true)
         }
+    }
+
+    func resetLaunchChoice() {
+        launchModel = ""
+        launchEffort = ""
+        launchOptions = LaunchOptions.make(config: providerConfiguration(selectedProvider))
     }
 
     func loadCachedHealth() {
@@ -87,6 +128,7 @@ final class PopoverViewModel: ObservableObject {
         guard !selectedProvider.isEmpty else { return }
         refreshQuota(name: selectedProvider)
         HealthService.shared.check(selectedProvider, force: true)
+        onPickerChanged?()   // 「刷新当前管线」是 providerActionsMenu 里唯一不关弹窗的动作：menu tracking 同样弄丢 key（#265）
     }
 
     /// CCR 上游管线名（体检行）。额度按它们存，gw-* 启动项经 gateway_provider 映射到同一份。
@@ -147,6 +189,7 @@ struct PopoverContentView: View {
     @ObservedObject var vm: PopoverViewModel
     @ObservedObject var gateway: CCRGatewayService
     @ObservedObject var lineCheck: LineCheckService
+    @ObservedObject private var promotions = PromotionService.shared
     @ObservedObject var sleepSwitch: SleepSwitchService = .shared
     @State private var expandedProvider: String?
     @State private var hoveredLine: String?
@@ -155,6 +198,7 @@ struct PopoverContentView: View {
     @State private var linesCollapsed = true
     @AppStorage("popover.sessionsCollapsed") private var sessionsCollapsed = false
     @State private var scrollContentHeight: CGFloat = 0
+    @State private var bottomHeight: CGFloat = 0
 
     var onRefresh: (() -> Void)?
     var onOpenProviderSettings: ((String) -> Void)?
@@ -163,7 +207,10 @@ struct PopoverContentView: View {
     /// 否则弹窗会比屏幕还高、顶部被推出屏幕（2026-10-01 实测 1630pt，屏幕 982pt）。
     private var maxScrollHeight: CGFloat {
         let screen = NSScreen.main?.visibleFrame.height ?? 800
-        return max(screen - 390, 240)  // 390 ≈ 启动区 + 保持唤醒卡 + 底栏 + 弹窗边距
+        // 下半区按实测高度扣（原先写死 390，启动区变高后弹窗超出屏幕、管线区底部看不到，2026-10-08）；
+        // 48 = 上下 padding 24 + 区间距 8 + 弹窗箭头/边距约 16
+        let reserved = bottomHeight > 0 ? bottomHeight + 48 : 390
+        return max(screen - reserved, 240)
     }
 
     var body: some View {
@@ -180,9 +227,15 @@ struct PopoverContentView: View {
             }
             .frame(height: min(max(scrollContentHeight, 1), maxScrollHeight))
             .onPreferenceChange(ScrollContentHeightKey.self) { scrollContentHeight = $0 }
-            launcherSection
-            sleepSwitchSection
-            quitSection
+            VStack(alignment: .leading, spacing: 8) {
+                launcherSection
+                sleepSwitchSection
+                quitSection
+            }
+            .background(GeometryReader { geo in
+                Color.clear.preference(key: BottomHeightKey.self, value: geo.size.height)
+            })
+            .onPreferenceChange(BottomHeightKey.self) { bottomHeight = $0 }
         }
         .padding(12)
         .frame(width: 360, alignment: .topLeading)
@@ -208,12 +261,13 @@ struct PopoverContentView: View {
     // 线路体检（B 路线③，消费 line-check.py --json，只读）
     private var lineCheckSection: some View {
         sectionCard {
-            collapsibleHeader("管线", icon: "list.bullet.rectangle", collapsed: $linesCollapsed) {
-                if !lineCheck.lines.isEmpty {
+            collapsibleHeader("线路状态", icon: "list.bullet.rectangle", collapsed: $linesCollapsed) {
+                if !sortedLineItems.isEmpty {
                     HStack(spacing: 5) {
-                        Text("\(lineCheck.lines.filter { !$0.isCheckBlock }.count) 条")
-                        // 计数为 0 的不画：「黄 0」摆在那儿会被读成有黄灯
-                        ForEach(["G", "Y", "R"].filter { (lineCheck.counts[$0] ?? 0) > 0 }, id: \.self) { lv in
+                        Text("\(sortedLineItems.count) 条")
+                        // 计数为 0 的不画：「黄 0」摆在那儿会被读成有黄灯；体检没跑成时计数是旧的，也不画
+                        ForEach(["G", "Y", "R"].filter { lineCheck.unavailable == nil && (lineCheck.counts[$0] ?? 0) > 0 },
+                                id: \.self) { lv in
                             HStack(spacing: 1) {
                                 Image(systemName: "circle.fill")
                                     .font(.system(size: 6))
@@ -228,19 +282,28 @@ struct PopoverContentView: View {
                 }
             }
             if !linesCollapsed {
+                // 体检没跑成只影响网关线路。原来整块换成这一句，网关出事时正需要看直连线路、点「重新体检」，
+                // 却连按钮一起看不到了（2026-10-09 线路状态审查）
                 if let reason = lineCheck.unavailable {
-                    Text(reason)
+                    Text("网关线路暂时看不到（体检没跑成）：\(reason)")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                } else {
-                    if lineCheck.lines.isEmpty {
-                        Text("体检中…")
-                            .font(.system(size: 11))
-                            .foregroundColor(.secondary)
-                    }
+                } else if lineCheck.lines.isEmpty {
+                    Text("体检中…")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+                Group {
                     VStack(spacing: 1) {
-                        ForEach(lineCheck.lines) { row in
+                        // 网关线路 + 直连线路合并成一个列表（原来只列网关的，火山/MiniMax 等直连线路看不到，2026-10-08）
+                        ForEach(sortedLineItems, id: \.id) { item in
+                            switch item {
+                            case .gateway(let row): lineRow(row)
+                            case .direct(let name): directLineRow(name)
+                            }
+                        }
+                        ForEach(gatewayCheckBlocks) { row in
                             lineRow(row)
                         }
                     }
@@ -258,6 +321,12 @@ struct PopoverContentView: View {
                         } label: {
                             Label("管线管理", systemImage: "slider.horizontal.3")
                         }
+                        Button {
+                            vm.onAddProvider?()
+                        } label: {
+                            Label("添加", systemImage: "plus.circle")
+                        }
+                        .help("添加管线")
                         Spacer()
                         if let at = lineCheck.checkedAt {
                             Text(at, style: .relative)
@@ -274,10 +343,46 @@ struct PopoverContentView: View {
                          + Text(lineCheck.notifyBlocked ? " · 系统通知已关，出事只在这里显示" : ""))
                             .font(.system(size: 10))
                             .foregroundColor(.secondary.opacity(0.7))
-                            .lineLimit(1)
+                            .lineLimit(3)   // 总结里带了没通的线路名，一行放不下
+                            .fixedSize(horizontal: false, vertical: true)
                             .help("每 6 小时经网关给每条线路的每个模型发一次极小的真实请求（max_tokens=8，按量线路有微小花费）。"
                                   + "只在「上次通、这次确定失败」时发通知；从没通过的线路不提醒——"
                                   + "只认 Claude Code 客户端的网关（如 AIGoCode、Yescode）这种探测本来就过不了，不代表线路坏了。")
+                    }
+                    // 网关静默换模：请求写 Opus 实际走 GLM 这种，会话里看不出来，只有账本说真话（PITFALLS #57）
+                    if let leak = lineCheck.routingLeakSummary {
+                        Text("⚠️ " + leak)
+                            .font(.system(size: 10))
+                            .foregroundColor(.orange)
+                            .lineLimit(3)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .help("CCR 账本里「请求的模型 ≠ 实际路由」= 被网关静默换了（回 200，会话里照样显示原模型名）。"
+                                  + "最常见是子代理：CCR 对子代理请求不看客户端指定的模型。10-09 起新开的会话由 ccgo 把子代理档写成全局默认模型，"
+                                  + "修复前启动的会话重开即可。每半小时查一次本机账本；新出现的最多每 6 小时发一次系统通知。")
+                    }
+                    // 优惠雷达：只提醒，不动任何配置（spec §0.3）。
+                    // popoverLine 返回 nil = 用户一条优惠页都没配，那就一行都不占地方。
+                    // ⚠️ 这一行故意不做成「没优惠就不显示」以外的智能：
+                    // 「今天没优惠」和「页抓不到」必须看起来不一样，所以文案由
+                    // PromotionNotifyPolicy.popoverLine 统一产出，这里只负责显示 + 点开面板。
+                    if let promo = PromotionNotifyPolicy.popoverLine(
+                        promotions: promotions.promotions, pages: promotions.pages,
+                        notifyBlocked: promotions.notifyBlocked, now: Date()) {
+                        Button {
+                            vm.onShowPromotionRadar?()
+                        } label: {
+                            Text(promo)
+                                .font(.system(size: 10))
+                                .foregroundColor(promo.hasPrefix("🌙") ? .secondary.opacity(0.7) : .orange)
+                                .lineLimit(3)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(.plain)
+                        .help("优惠雷达：每天 21:00 抓一次各线路配置的公开定价页，21:30 汇总提醒。\n"
+                              + "🌙 = 官方页字面写着、已核实的分时段优惠；❓ = 未核实的限时活动，只在面板里露脸，永远不弹通知。\n"
+                              + "只读公开页，不发密钥，不改你的线路、不改网关。点开看原文证据和每一页的抓取结果。")
                     }
                 }
             }
@@ -300,18 +405,15 @@ struct PopoverContentView: View {
                 Spacer(minLength: 8)
                 if lineCheck.probing.contains(row.name) {
                     ProgressView().controlSize(.mini)
+                } else if !expanded, hasProbeProblem(row.name) {
+                    // 报错不平铺：收起时只挂一个标记，点开行才看全文（2026-10-08 用户要求）
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                        .help("实测有问题，点开查看")
                 }
                 if let balance {
-                    HStack(spacing: 4) {
-                        if balance.status == .ok, let progress = balance.tightestWindow?.progress {
-                            QuotaRing(progress: progress, diameter: 10, lineWidth: 2)
-                        }
-                        Text(balance.shortText)
-                            .font(.system(size: 11))
-                            .monospacedDigit()
-                            .foregroundColor(quotaTone(balance))
-                            .lineLimit(1)
-                    }
+                    quotaBadge(balance)
                 }
                 Image(systemName: "chevron.right")
                     .font(.system(size: 9, weight: .semibold))
@@ -325,16 +427,18 @@ struct PopoverContentView: View {
                 withAnimation(.easeInOut(duration: 0.15)) {
                     expandedProvider = expanded ? nil : row.name
                 }
-                if !expanded, !row.isCheckBlock, lineCheck.usageTexts[row.name] == nil {
+                // 每次展开都重取：原来只取一次，之后一直显示第一次的数，过了午夜还把昨天的数标成「今日」
+                // （本机 RPC，很快；旧数先留着，新数到了再换，不闪「获取中」）
+                if !expanded, !row.isCheckBlock {
                     lineCheck.usage(name: row.name)
                 }
             }
             .help(balance?.summaryLine() ?? row.note ?? "")
 
-            if lineCheck.probing.contains(row.name) || lineCheck.probeResults[row.name] != nil {
+            if lineCheck.probing.contains(row.name) || (expanded && lineCheck.probeResults[row.name] != nil) {
                 Text(lineCheck.probing.contains(row.name)
                      ? "测通中…（逐模型真实请求，最长约 2 分钟）"
-                     : (lineCheck.probeResults[row.name] ?? ""))
+                     : probeResultText(row.name))
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -354,6 +458,154 @@ struct PopoverContentView: View {
         .onHover { inside in
             if inside { hoveredLine = row.name } else if hoveredLine == row.name { hoveredLine = nil }
         }
+    }
+
+    private enum LineItem {
+        case gateway(LineCheckService.LineRow)
+        case direct(String)
+        var id: String {
+            switch self {
+            case .gateway(let r): return "gw:" + r.name
+            case .direct(let n): return "direct:" + n
+            }
+        }
+        var key: String {
+            switch self {
+            case .gateway(let r): return r.name
+            case .direct(let n): return n
+            }
+        }
+    }
+
+    private var directLines: [String] { vm.directLines }
+
+    /// 体检没跑成（unavailable）时 lines 里是上一次的旧结果，不能当现状展示
+    private var gatewayLineRows: [LineCheckService.LineRow] {
+        lineCheck.unavailable == nil ? lineCheck.lines.filter { !$0.isCheckBlock } : []
+    }
+
+    private var gatewayCheckBlocks: [LineCheckService.LineRow] {
+        lineCheck.unavailable == nil ? lineCheck.lines.filter(\.isCheckBlock) : []
+    }
+
+    /// 排序：近 7 天启动次数 → 网关近 7 天请求次数 → 原顺序（网关在前）。常用的在上面。
+    private var sortedLineItems: [LineItem] {
+        let items = gatewayLineRows.map(LineItem.gateway)
+            + directLines.map(LineItem.direct)
+        return items.enumerated().sorted { a, b in
+            let la = lineCheck.launchCounts[a.element.key] ?? 0, lb = lineCheck.launchCounts[b.element.key] ?? 0
+            if la != lb { return la > lb }
+            let ra = lineCheck.weeklyRequests[a.element.key] ?? 0, rb = lineCheck.weeklyRequests[b.element.key] ?? 0
+            if ra != rb { return ra > rb }
+            return a.offset < b.offset
+        }.map(\.element)
+    }
+
+    private func directLevel(_ name: String) -> String {
+        switch HealthService.shared.cached(name)?.status {
+        case .ok?: return "G"
+        case .slow?, .exhausted?: return "Y"
+        case .down?: return "R"
+        default: return "-"
+        }
+    }
+
+    @ViewBuilder
+    private func directLineRow(_ name: String) -> some View {
+        let expanded = expandedProvider == "direct:" + name
+        let balance = vm.balances[BalanceService.shared.quotaKey(for: name)]
+        let health = HealthService.shared.cached(name)
+        let config = providerConfiguration(name)
+        let env = config?["env"] as? [String: Any]
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "circle.fill")
+                    .font(.system(size: 8))
+                    .foregroundColor(lineLevelColor(directLevel(name)))
+                Text(providerDisplayName(name))
+                    .font(.system(size: 12))
+                    .lineLimit(1)
+                Text("直连")
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 4)
+                    .background(Color.secondary.opacity(0.12))
+                    .clipShape(Capsule())
+                Spacer(minLength: 8)
+                if !expanded, health?.status == .down || health?.status == .exhausted {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                        .help("有问题，点开查看")
+                }
+                if let balance {
+                    quotaBadge(balance)
+                }
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.secondary.opacity(0.6))
+                    .rotationEffect(.degrees(expanded ? 90 : 0))
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    expandedProvider = expanded ? nil : "direct:" + name
+                }
+            }
+            if expanded {
+                VStack(alignment: .leading, spacing: 4) {
+                    Button {
+                        vm.onEditDirectLine?(name)
+                    } label: {
+                        Label("编辑此线路", systemImage: "pencil")
+                    }
+                    .help("弹出这条线路的编辑框：地址、key、模型")
+                    .buttonStyle(.plain)
+                    .foregroundColor(.accentColor)
+                    if let detail = health?.detail {
+                        Text("状态：\(detail)")
+                            .foregroundColor(health?.status == .down ? .red : .secondary)
+                            .textSelection(.enabled)
+                    }
+                    if let base = env.flatMap({ SecretResolver.value(from: $0["ANTHROPIC_BASE_URL"]) }) {
+                        Text("地址：\(gatewayVisibleText(base))").foregroundColor(.secondary)
+                    }
+                    if let model = env.flatMap({ SecretResolver.value(from: $0["ANTHROPIC_MODEL"]) }) {
+                        Text("模型：\(model)").foregroundColor(.secondary)
+                    }
+                    if let n = lineCheck.launchCounts[name], n > 0 {
+                        Text("近 7 天启动 \(n) 次").foregroundColor(.secondary)
+                    }
+                    // 用户问过「直连为什么存在、怎么来的」：直连是最早的接法，「添加管线」加的都是直连（写 providers/<名>.json）
+                    Text("直连：Claude Code 直接连厂商，不经过本机网关（「添加管线」加的都是这种），所以没有网关的体检、测通和每日用量。")
+                        .foregroundColor(.secondary.opacity(0.8))
+                }
+                .font(.system(size: 10))
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 6)
+                .padding(.bottom, 4)
+            }
+        }
+    }
+
+    /// 测通结论带上「多久以前测的」：几天前的失败和刚测的长得一样，会被当成现状
+    private func probeResultText(_ name: String) -> String {
+        lineCheck.probeResults[name]?.displayText ?? ""
+    }
+
+    /// 网关线路的排序依据（启动次数优先，其次网关请求数）；都是 0 就不占一行
+    private func rankBasisText(_ name: String) -> String? {
+        let launches = lineCheck.launchCounts[name] ?? 0, requests = lineCheck.weeklyRequests[name] ?? 0
+        guard launches > 0 || requests > 0 else { return nil }
+        return "近 7 天启动 \(launches) 次 · 网关请求 \(requests) 次"
+    }
+
+    /// 有测通结果且不是通过（通过文案以 ✅ 开头）
+    private func hasProbeProblem(_ name: String) -> Bool {
+        guard let result = lineCheck.probeResults[name], !result.text.isEmpty else { return false }
+        return !result.text.hasPrefix("✅")
     }
 
     private func lineDetail(_ row: LineCheckService.LineRow, balance: BalanceInfo?) -> some View {
@@ -378,6 +630,12 @@ struct PopoverContentView: View {
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                // 列表按这两个数排序，摆出来才知道为什么它排在这儿
+                if let basis = rankBasisText(row.name) {
+                    Text(basis)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
                 HStack(spacing: 12) {
                     Button {
                         lineCheck.probe(name: row.name)
@@ -386,11 +644,14 @@ struct PopoverContentView: View {
                     }
                     .disabled(lineCheck.probing.contains(row.name))
                     .help("向该线路发真实探测（按量线路有微小花费）")
+                    // 原来「设置」（这条线路的设置框）和「编辑此线路」（整个管线管理窗口）并排，
+                    // 两个按钮像同一件事却去不同地方；合成一个，直接弹这条线路自己的编辑框（2026-10-09）
                     Button {
                         onOpenProviderSettings?(row.name)
                     } label: {
-                        Label("设置", systemImage: "gearshape")
+                        Label("编辑此线路", systemImage: "pencil")
                     }
+                    .help("弹出这条线路的设置框：地址、key、模型列表")
                     Spacer()
                 }
                 .buttonStyle(.plain)
@@ -507,6 +768,23 @@ struct PopoverContentView: View {
             return .orange
         default:
             return .secondary.opacity(0.6)
+        }
+    }
+
+    /// 行右侧：有窗口的线路用 G2 chip；钱包/状态行保留原文字（spec 2026-10-10）。
+    @ViewBuilder
+    private func quotaBadge(_ balance: BalanceInfo) -> some View {
+        let bounded = balance.boundedWindows
+        if balance.status == .ok, !bounded.isEmpty {
+            QuotaChips(windows: bounded)
+                .help(balance.tooltipLine())
+        } else {
+            Text(balance.shortText)
+                .font(.system(size: 11))
+                .monospacedDigit()
+                .foregroundColor(quotaTone(balance))
+                .lineLimit(1)
+                .help(balance.tooltipLine())
         }
     }
 
@@ -647,6 +925,30 @@ struct PopoverContentView: View {
             }
 
             HStack(spacing: 6) {
+                formLabel("模型")
+                Picker("", selection: $vm.launchModel) {
+                    Text(vm.launchOptions.defaultModelLabel).tag("")
+                    ForEach(vm.launchOptions.models, id: \.self) { model in
+                        Text(modelDisplayName(model)).tag(model)
+                    }
+                }
+                .labelsHidden()
+                .disabled(vm.launchOptions.models.isEmpty)
+                .frame(minWidth: 0, maxWidth: .infinity)
+                .help("只用于这次启动；管线的默认模型在「管线管理」里改")
+                formLabel("思考")
+                Picker("", selection: $vm.launchEffort) {
+                    Text(vm.launchOptions.defaultEffortLabel).tag("")
+                    ForEach(GatewayLineService.effortLevels, id: \.self) { level in
+                        Text(effortDisplayName(level)).tag(level)
+                    }
+                }
+                .labelsHidden()
+                .frame(minWidth: 0, maxWidth: .infinity)
+                .help("只用于这次启动（带 --effort）；管线的默认思考强度在「管线管理」里改")
+            }
+
+            HStack(spacing: 6) {
                 formLabel("项目")
                 Picker("", selection: $vm.selectedProject) {
                     ForEach(vm.projects, id: \.path) { proj in
@@ -688,7 +990,13 @@ struct PopoverContentView: View {
             Button(action: { vm.onSpeedTest?() }) {
                 Label("线路测速", systemImage: "gauge.with.dots.needle.33percent")
             }
+            Button(action: { vm.onShowPromotionRadar?() }) {
+                Label("优惠雷达", systemImage: "moon.stars")
+            }
             Divider()
+            Button(action: { vm.onAddProvider?() }) {
+                Label("添加管线…", systemImage: "plus.circle")
+            }
             Button(action: { vm.onShowProviderManager?() }) {
                 Label("管线管理", systemImage: "slider.horizontal.3")
             }
@@ -725,7 +1033,12 @@ struct PopoverContentView: View {
     }
 
     private func triggerLaunch() {
-        vm.onLaunch?(vm.selectedProvider, vm.selectedProject, vm.selectedTerminal)
+        vm.onLaunch?(vm.selectedProvider, vm.selectedProject, vm.selectedTerminal,
+                     vm.launchModel.isEmpty ? nil : vm.launchModel,
+                     vm.launchEffort.isEmpty ? nil : vm.launchEffort)
+        // 只管这一次：启动后回到管线默认
+        vm.launchModel = ""
+        vm.launchEffort = ""
     }
 
     private var sessionsSection: some View {
@@ -764,6 +1077,9 @@ struct PopoverContentView: View {
                             Text(session.num != nil ? "#\(session.sessionNumber)" : "pid \(session.pid)")
                                 .font(.system(size: 13, weight: .semibold, design: .monospaced))
                                 .foregroundColor(.primary.opacity(0.85))
+                                .help(session.hasTerminal
+                                      ? "点这一行：把这个会话的终端窗口切到前台（\(session.tty)）"
+                                      : "这个进程没有终端，没有窗口可以切过去")
 
                             // 标题优先：让人一眼把这行对上 claude --resume 里的对话；
                             // 还没生成 ai-title 的新会话退回项目名。
@@ -885,8 +1201,14 @@ struct PopoverContentView: View {
                         Menu {
                             ForEach(vm.providers, id: \.self) { p in
                                 if !isAdopted {
-                                    Button("切换到 \(providerDisplayName(p))") {
-                                        if p != session.provider {
+                                    if p == session.provider {
+                                        // 同线路也走 pending 重启：doSwitch 对同线路写 sessionId → ccgo --resume，
+                                        // 套用线路当前的默认模型/思考强度，并换掉旧进程里 settings env 的残留
+                                        Button("重启（套用 \(providerDisplayName(p)) 当前设置，接着聊）") {
+                                            vm.onSwitch?(session, p)
+                                        }
+                                    } else {
+                                        Button("切换到 \(providerDisplayName(p))") {
                                             vm.onSwitch?(session, p)
                                         }
                                     }
@@ -930,6 +1252,17 @@ struct PopoverContentView: View {
                     .padding(.leading, 8)
                 }
                 .padding(.vertical, 2)
+                // 整行可点 = 切到这个会话的终端窗口。行内的按钮/菜单自己吃掉点击，不会触发这里；
+                // 没有 TTY 的后台进程没有窗口可切，不挂手势（按钮在而功能不灵比明说不能做更糟）。
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    guard session.hasTerminal else { return }
+                    vm.onFocus?(session)
+                }
+                .onHover { inside in
+                    // 用 set 不用 push/pop：行在悬停中消失（会话退出）会让 push/pop 栈失衡，光标卡成手形
+                    if inside && session.hasTerminal { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+                }
                 if idx < vm.sessions.count - 1 {
                     Divider().padding(.vertical, 1)
                 }
@@ -1256,6 +1589,12 @@ private struct LineQuotaDetail: View {
                 .help("立即重新查询额度")
             }
             if let balance {
+                if let chain = balance.tightestChain() {
+                    Text(chain)
+                        .font(.system(size: 10))
+                        .foregroundColor(.primary.opacity(0.85))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if let detail = balance.planDetail {
                     Text(detail)
                         .font(.system(size: 10))
@@ -1313,10 +1652,7 @@ private struct LineQuotaDetail: View {
     }
 
     private func updatedText(_ date: Date) -> String {
-        let seconds = Int(Date().timeIntervalSince(date))
-        if seconds < 60 { return "刚刚更新" }
-        if seconds < 3600 { return "\(seconds / 60) 分钟前更新" }
-        return "\(seconds / 3600) 小时前更新"
+        AgeText.ago(date) + "更新"   // 超过一天原来写「50 小时前更新」
     }
 }
 
@@ -1353,7 +1689,66 @@ struct QuotaRing: View {
     }
 }
 
-private struct ScrollContentHeightKey: PreferenceKey {
+/// 健康档→颜色（视图层；QuotaAdapters 不 import SwiftUI）。
+extension AlertLevel {
+    var fillColor: Color {
+        switch self {
+        case .ok: return .accentColor
+        case .warn: return .orange
+        case .critical: return .red
+        }
+    }
+    var labelColor: Color {
+        switch self {
+        case .ok: return .secondary
+        case .warn: return .orange
+        case .critical: return .red
+        }
+    }
+}
+
+/// G2 chip：9pt 名字 + 下方定宽填充条（填充长=剩余比例、色=健康档；告警时名字同色）。
+/// 同一行 chip 等宽（按该行最宽名字），条长才可横向比较。行内不放精确数字——
+/// tooltip 与展开区是唯一入口（spec 2026-10-10）。
+private struct QuotaChips: View {
+    let windows: [QuotaWindow]
+
+    var body: some View {
+        let shown = Array(windows.prefix(3))
+        let width = Self.chipWidth(for: shown)
+        HStack(spacing: 6) {
+            ForEach(shown) { window in
+                VStack(spacing: 2) {
+                    Text(window.label)
+                        .font(.system(size: 9))
+                        .lineLimit(1)
+                        .foregroundColor(window.alertLevel.labelColor)
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.secondary.opacity(0.13))
+                        Capsule()
+                            .fill(window.alertLevel.fillColor)
+                            .frame(width: width * CGFloat(min(max(window.remainingRatio ?? 0, 0), 1)))
+                    }
+                    .frame(width: width, height: 3)
+                }
+                .frame(width: width)
+            }
+        }
+    }
+
+    /// 9pt 中文约 9pt/字；取该行最宽名字为基准，下限 30pt。
+    static func chipWidth(for windows: [QuotaWindow]) -> CGFloat {
+        let chars = windows.map { $0.label.count }.max() ?? 2
+        return max(30, CGFloat(chars) * 9 + 4)
+    }
+}
+
+private struct BottomHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
+struct ScrollContentHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())

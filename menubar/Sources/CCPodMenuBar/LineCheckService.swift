@@ -5,6 +5,14 @@ import UserNotifications
 // 只消费实验室资产 line-check.py 的 --json 机器接口，不复制体检逻辑
 // （分层管线见 model-gateway/docs/architecture.md：实验室产出，产品表面化）。
 final class LineCheckService: ObservableObject {
+    /// 测通结论 + 测的时间。原来只存文字，几天前的失败结论看起来和刚测的一样（2026-10-09 线路状态审查）。
+    struct ProbeResult {
+        let text: String
+        let timestamp: Date
+        /// 展示用：结论后面带「多久以前测的」（弹窗行内、错误诊断窗口共用）
+        var displayText: String { "\(text)（\(AgeText.ago(timestamp))测）" }
+    }
+
     struct LineRow: Identifiable {
         let name: String
         let level: String      // G / Y / R
@@ -65,8 +73,11 @@ final class LineCheckService: ObservableObject {
     @Published var running = false
     // 行内动作：测通 / 用量
     @Published var probing: Set<String> = []
-    @Published var probeResults: [String: String] = [:]
+    @Published var probeResults: [String: ProbeResult] = [:]
     @Published var usageTexts: [String: String] = [:]
+    /// 排序依据：近 7 天启动次数（ccpod-launch-log.jsonl，键=网关上游名或直连线路 ID）+ 网关近 7 天请求次数
+    @Published var launchCounts: [String: Int] = [:]
+    @Published var weeklyRequests: [String: Int] = [:]
     private var resolvedScript: String?
 
     /// 解析脚本位置：实验室源（开发版）较新则同步到产品副本；返回实际可执行路径。
@@ -122,16 +133,27 @@ final class LineCheckService: ObservableObject {
         case .failure(let reason): publish(unavailable: reason.text); return
         case .success(let p): payload = p
         }
-        apply(payload, demo: false)
+        // 按近 7 天请求次数排序（常用的在上）；取不到用量就保持体检脚本原序，不影响体检本身
+        let usage = CCRConfigService.serviceState().flatMap { try? CCRConfigService.weeklyRequestCounts(state: $0) } ?? [:]
+        let launches = Self.loadLaunchCounts()
+        DispatchQueue.main.async { [weak self] in
+            self?.weeklyRequests = usage
+            self?.launchCounts = launches
+        }
+        apply(payload, demo: false, usage: usage)
     }
 
     /// demo = 演示数据：每一行的名字后面都标「（演示数据）」，不会被当成真实体检结果。
-    private func apply(_ payload: Payload, demo: Bool) {
+    private func apply(_ payload: Payload, demo: Bool, usage: [String: Int] = [:]) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.running = false
             self.counts = payload.counts
-            var rows = payload.providers.map { p in
+            let ordered = payload.providers.enumerated().sorted { a, b in
+                let ua = usage[a.element.name] ?? 0, ub = usage[b.element.name] ?? 0
+                return ua != ub ? ua > ub : a.offset < b.offset   // 同次数保持原序（稳定）
+            }.map(\.element)
+            var rows = ordered.map { p in
                 LineRow(name: p.name, level: p.level,
                         note: (p.msgs?.first { $0.level != "G" }?.msg).map { gatewayVisibleText($0) },
                         displayName: demo ? LineCheckFixture.label(gatewayProviderGroupDisplayName(p.name)) : nil)
@@ -154,6 +176,37 @@ final class LineCheckService: ObservableObject {
             self.lines = rows
             self.checkedAt = Date()
         }
+    }
+
+    /// 近 7 天每条管线被启动了几次。gw-*/别名线路归到它的网关上游名，和体检行同名。
+    static func loadLaunchCounts(now: Date = Date()) -> [String: Int] {
+        let path = NSString(string: "~/.claude/ccpod-launch-log.jsonl").expandingTildeInPath
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [:] }
+        let since = now.timeIntervalSince1970 - 7 * 86_400
+        var counts: [String: Int] = [:]
+        var keyCache: [String: String] = [:]
+        for line in text.split(separator: "\n") {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let at = obj["at"] as? Double, at >= since,
+                  let provider = obj["provider"] as? String else { continue }
+            let key = keyCache[provider] ?? usageKey(provider)
+            keyCache[provider] = key
+            counts[key, default: 0] += 1
+        }
+        return counts
+    }
+
+    static func usageKey(_ provider: String) -> String {
+        switch provider {
+        case "ccr-bailian": return "bailian"
+        case "ccr-dear": return "dragoncode"
+        default: break
+        }
+        guard let config = providerConfiguration(provider) else { return provider }
+        if let vendor = config["gateway_provider"] as? String { return vendor }
+        if let pipeline = config["pipeline_id"] as? String,
+           let vendor = providerConfiguration(pipeline)?["gateway_provider"] as? String { return vendor }
+        return provider
     }
 
     private func publish(unavailable reason: String) {
@@ -223,7 +276,7 @@ final class LineCheckService: ObservableObject {
     func probe(name: String) {
         guard !probing.contains(name) else { return }
         guard let script = Self.resolveScript() else {
-            probeResults[name] = "未找到 line-check.py"
+            probeResults[name] = ProbeResult(text: "未找到 line-check.py", timestamp: Date())
             return
         }
         probing.insert(name)
@@ -232,7 +285,7 @@ final class LineCheckService: ObservableObject {
             let result = Self.runProbe(name: name, script: script)
             DispatchQueue.main.async {
                 self.probing.remove(name)
-                self.probeResults[name] = gatewayVisibleText(result.text)
+                self.probeResults[name] = ProbeResult(text: gatewayVisibleText(result.text), timestamp: Date())
             }
         }
     }
@@ -245,13 +298,21 @@ final class LineCheckService: ObservableObject {
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         do { try process.run() } catch { return (.unsure, "无法启动 python3") }
+        let timedOut = AtomicFlag()
         let watchdog = DispatchSource.makeTimerSource(queue: .global())
         watchdog.schedule(deadline: .now() + 120)   // 探测含逐模型真实请求，放宽到 120s
-        watchdog.setEventHandler { [weak process] in process?.terminate() }
+        watchdog.setEventHandler { [weak process] in
+            timedOut.set()
+            process?.terminate()
+        }
         watchdog.resume()
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         watchdog.cancel()
         process.waitUntilExit()
+        // 被看门狗杀掉时输出是半截的，原来落到下面的解析分支，显示成「探测输出解析失败」像脚本坏了（静态体检同款坑）
+        if timedOut.isSet || process.terminationReason == .uncaughtSignal {
+            return (.unsure, "探测超时：2 分钟没测完，已停止（上游很慢或卡住，稍后再测）")
+        }
         // 脚本按子串匹配名称（probe "kimi" 会连 "kimi-intl" 一起测），所以按全名挑，不取第一个
         guard let payload = try? JSONDecoder().decode(Payload.self, from: data),
               let provider = payload.providers.first(where: { $0.name == name }) ?? payload.providers.first else {
@@ -273,6 +334,10 @@ final class LineCheckService: ObservableObject {
     @Published var autoProbeSummary: String?
     /// 系统通知被关（2026-10-05 实测本机就是：UNErrorDomain Code=1 not allowed）→ 提醒只剩 popover 这一行，UI 要明说
     @Published var notifyBlocked = false
+    /// 网关静默换模（请求模型 ≠ 实际路由）那一行；nil = 没有或账本读不了。RoutingLeakService 每半小时算一次。
+    @Published var routingLeakSummary: String?
+    @Published var routingLeakCheckedAt: Date?
+    private var routingLeakTimer: Timer?
     private var autoProbeTimer: Timer?
     private var autoProbeEnabled = false
     private var autoProbeRunning = false
@@ -297,12 +362,42 @@ final class LineCheckService: ObservableObject {
         autoProbeEnabled = false
         autoProbeTimer?.invalidate()
         autoProbeTimer = nil
+        routingLeakTimer?.invalidate()
+        routingLeakTimer = nil
+    }
+
+    // MARK: - 网关静默换模（判定与节奏见 RoutingLeakPolicy）
+    // 账本是本机 sqlite，只读、毫秒级，可以比周期实测（6 小时）勤得多；首轮不等。
+
+    func startRoutingLeakWatch(interval: TimeInterval) {
+        routingLeakTimer?.invalidate()
+        checkRoutingLeak()
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in self?.checkRoutingLeak() }
+        RunLoop.main.add(timer, forMode: .common)
+        routingLeakTimer = timer
+    }
+
+    func checkRoutingLeak() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let summary = RoutingLeakService.check()
+            DispatchQueue.main.async {
+                self?.routingLeakSummary = summary
+                self?.routingLeakCheckedAt = Date()
+            }
+        }
     }
 
     /// 主线程调用。逐条串行测（不并发打网关）；一轮最坏 = 线路数 × 120s 看门狗。
     func runAutoProbe() {
-        guard autoProbeEnabled, !autoProbeRunning, let script = Self.resolveScript() else { return }
+        guard autoProbeEnabled, !autoProbeRunning else { return }
+        guard let script = Self.resolveScript() else {
+            // 原来静默 return：自动实测那一行停在上一轮的旧结论，看不出已经不跑了
+            autoProbedAt = Date()
+            autoProbeSummary = "自动实测未执行：未找到 line-check.py"
+            return
+        }
         autoProbeRunning = true
+        let roundStartedAt = Date()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             var results: [(name: String, verdict: LineProbeVerdict, text: String)] = []
             var failure: String?
@@ -317,7 +412,7 @@ final class LineCheckService: ObservableObject {
             // 顺带做一轮新模型自动上架（发现 → 直连实测 → 通过才写网关，全程有上限约束）
             let onboardSummary = ModelOnboardService.discoverRound().summary
             DispatchQueue.main.async {
-                self?.finishAutoProbe(results, failure: failure)
+                self?.finishAutoProbe(results, failure: failure, roundStartedAt: roundStartedAt)
                 if let onboardSummary {
                     self?.autoProbeSummary = [self?.autoProbeSummary, gatewayVisibleText(onboardSummary)]
                         .compactMap { $0 }.joined(separator: "；")
@@ -326,7 +421,8 @@ final class LineCheckService: ObservableObject {
         }
     }
 
-    private func finishAutoProbe(_ results: [(name: String, verdict: LineProbeVerdict, text: String)], failure: String?) {
+    private func finishAutoProbe(_ results: [(name: String, verdict: LineProbeVerdict, text: String)], failure: String?,
+                                 roundStartedAt: Date) {
         autoProbeRunning = false
         autoProbedAt = Date()
         let defaults = UserDefaults.standard
@@ -344,11 +440,17 @@ final class LineCheckService: ObservableObject {
         for r in results {
             let previous = old[r.name].flatMap(LineProbeVerdict.init(rawValue:))
             if previous == .pass { previouslyPassing += 1 }
-            if LineAutoProbePolicy.shouldAlert(previous: previous, current: r.verdict) {
-                newlyFailed.append(r.name)
-                probeResults[r.name] = gatewayVisibleText(Self.autoProbeAlertPrefix + r.text)
-            } else if r.verdict == .pass, probeResults[r.name]?.hasPrefix(Self.autoProbeAlertPrefix) == true {
-                probeResults[r.name] = nil   // 恢复了就撤掉自己挂的红字（手动测通的结果不碰）
+            let existing = probeResults[r.name]
+            let alert = LineAutoProbePolicy.shouldAlert(previous: previous, current: r.verdict)
+            if alert { newlyFailed.append(r.name) }
+            // 新结论盖旧结论，规则与单测见 LineAutoProbePolicy.resultUpdate
+            switch LineAutoProbePolicy.resultUpdate(alert: alert, current: r.verdict, hasExisting: existing != nil,
+                                                    existingIsNewer: existing.map { $0.timestamp >= roundStartedAt } ?? false) {
+            case .keep: break
+            case .showFailure:
+                probeResults[r.name] = ProbeResult(text: gatewayVisibleText(Self.autoProbeAlertPrefix + r.text), timestamp: Date())
+            case .showPass:
+                probeResults[r.name] = ProbeResult(text: "✅ 自动实测通过", timestamp: Date())
             }
             if let next = LineAutoProbePolicy.nextBaseline(previous: previous, current: r.verdict) {
                 baseline[r.name] = next.rawValue
@@ -356,7 +458,10 @@ final class LineCheckService: ObservableObject {
         }
         defaults.set(baseline, forKey: Self.autoProbeBaselineKey)
         let passed = results.filter { $0.verdict == .pass }.count
-        autoProbeSummary = "自动实测 \(passed)/\(results.count) 通"
+        autoProbeSummary = LineAutoProbePolicy.summary(
+            passed: passed, total: results.count,
+            failed: results.filter { $0.verdict == .hardFail }.map { gatewayProviderGroupDisplayName($0.name) },
+            unsure: results.filter { $0.verdict == .unsure }.map { gatewayProviderGroupDisplayName($0.name) })
         defaults.set(["at": Date().timeIntervalSince1970,
                       "verdicts": Dictionary(uniqueKeysWithValues: results.map { ($0.name, $0.verdict.rawValue) }),
                       "alerted": newlyFailed],

@@ -78,6 +78,19 @@ enum CCRConfigService {
         _ = try rpc(method: "applyProfile", args: [], state: state)
     }
 
+    /// 近 7 天各管线请求次数（管线区按使用频率排序用）。
+    static func weeklyRequestCounts(state: State) throws -> [String: Int] {
+        let raw = try rpc(method: "getUsageStats", args: ["week"], state: state)
+        guard let value = raw as? [String: Any],
+              let rows = value["providerModels"] as? [[String: Any]] else { return [:] }
+        var counts: [String: Int] = [:]
+        for row in rows {
+            guard let provider = row["provider"] as? String else { continue }
+            counts[provider, default: 0] += (row["requestCount"] as? Int) ?? 0
+        }
+        return counts
+    }
+
     /// 今日用量（经网关统计，按 provider 过滤）→ 多行摘要文本。
     static func usageToday(provider: String, state: State) throws -> String {
         let raw = try rpc(method: "getUsageStats", args: ["today", ["provider": provider]], state: state)
